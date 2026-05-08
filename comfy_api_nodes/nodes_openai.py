@@ -2,6 +2,7 @@ import base64
 import os
 from enum import Enum
 from io import BytesIO
+from urllib.parse import urljoin
 
 import numpy as np
 import torch
@@ -599,6 +600,234 @@ class OpenAIGPTImage1(IO.ComfyNode):
         return IO.NodeOutput(await validate_and_cast_response(response))
 
 
+class OpenAIGPTImageCustomBaseURL(IO.ComfyNode):
+
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="OpenAIGPTImageCustomBaseURL",
+            display_name="OpenAI GPT Image (Custom Base URL)",
+            category="api node/image/OpenAI",
+            description="Generates images synchronously via an OpenAI-compatible GPT Image endpoint with custom base URL.",
+            inputs=[
+                IO.String.Input(
+                    "prompt",
+                    default="",
+                    multiline=True,
+                    tooltip="Text prompt for GPT Image",
+                ),
+                IO.String.Input(
+                    "base_url",
+                    default="https://api.openai.com/v1",
+                    tooltip="OpenAI-compatible API base URL, e.g. https://api.openai.com/v1",
+                ),
+                IO.String.Input(
+                    "api_key",
+                    default="",
+                    optional=True,
+                    tooltip="Optional API key used as Authorization: Bearer <api_key>",
+                ),
+                IO.Int.Input(
+                    "seed",
+                    default=0,
+                    min=0,
+                    max=2**31 - 1,
+                    step=1,
+                    display_mode=IO.NumberDisplay.number,
+                    control_after_generate=True,
+                    tooltip="not implemented yet in backend",
+                    optional=True,
+                ),
+                IO.Combo.Input(
+                    "quality",
+                    default="low",
+                    options=["low", "medium", "high"],
+                    tooltip="Image quality, affects cost and generation time.",
+                    optional=True,
+                ),
+                IO.Combo.Input(
+                    "background",
+                    default="auto",
+                    options=["auto", "opaque", "transparent"],
+                    tooltip="Return image with or without background",
+                    optional=True,
+                ),
+                IO.Combo.Input(
+                    "size",
+                    default="auto",
+                    options=[
+                        "auto",
+                        "1024x1024",
+                        "1024x1536",
+                        "1536x1024",
+                        "2048x2048",
+                        "2048x1152",
+                        "1152x2048",
+                        "3840x2160",
+                        "2160x3840",
+                    ],
+                    tooltip="Image size",
+                    optional=True,
+                ),
+                IO.Int.Input(
+                    "n",
+                    default=1,
+                    min=1,
+                    max=8,
+                    step=1,
+                    tooltip="How many images to generate",
+                    display_mode=IO.NumberDisplay.number,
+                    optional=True,
+                ),
+                IO.Image.Input(
+                    "image",
+                    tooltip="Optional reference image for image editing.",
+                    optional=True,
+                ),
+                IO.Mask.Input(
+                    "mask",
+                    tooltip="Optional mask for inpainting (white areas will be replaced)",
+                    optional=True,
+                ),
+                IO.Combo.Input(
+                    "model",
+                    options=["gpt-image-1", "gpt-image-1.5", "gpt-image-2"],
+                    default="gpt-image-2",
+                    optional=True,
+                ),
+            ],
+            outputs=[
+                IO.Image.Output(),
+            ],
+            hidden=[
+                IO.Hidden.unique_id,
+            ],
+            is_api_node=True,
+        )
+
+    @classmethod
+    async def execute(
+        cls,
+        prompt: str,
+        base_url: str = "https://api.openai.com/v1",
+        api_key: str = "",
+        seed: int = 0,
+        quality: str = "low",
+        background: str = "opaque",
+        image: Input.Image | None = None,
+        mask: Input.Image | None = None,
+        n: int = 1,
+        size: str = "1024x1024",
+        model: str = "gpt-image-1",
+    ) -> IO.NodeOutput:
+        validate_string(prompt, strip_whitespace=False)
+        validate_string(base_url, strip_whitespace=True, min_length=1)
+
+        if mask is not None and image is None:
+            raise ValueError("Cannot use a mask without an input image")
+
+        if model in ("gpt-image-1", "gpt-image-1.5"):
+            if size not in ("auto", "1024x1024", "1024x1536", "1536x1024"):
+                raise ValueError(f"Resolution {size} is only supported by GPT Image 2 model")
+
+        if model == "gpt-image-1":
+            price_extractor = calculate_tokens_price_image_1
+        elif model == "gpt-image-1.5":
+            price_extractor = calculate_tokens_price_image_1_5
+        elif model == "gpt-image-2":
+            price_extractor = calculate_tokens_price_image_2_0
+            if background == "transparent":
+                raise ValueError("Transparent background is not supported for GPT Image 2 model")
+        else:
+            raise ValueError(f"Unknown model: {model}")
+
+        normalized_base_url = base_url.strip().rstrip("/") + "/"
+        headers: dict[str, str] = {}
+        if api_key.strip():
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+
+        if image is not None:
+            files = []
+            batch_size = image.shape[0]
+            for i in range(batch_size):
+                single_image = image[i : i + 1]
+                scaled_image = downscale_image_tensor(single_image, total_pixels=2048 * 2048).squeeze()
+
+                image_np = (scaled_image.numpy() * 255).astype(np.uint8)
+                img = Image.fromarray(image_np)
+                img_byte_arr = BytesIO()
+                img.save(img_byte_arr, format="PNG")
+                img_byte_arr.seek(0)
+
+                if batch_size == 1:
+                    files.append(("image", (f"image_{i}.png", img_byte_arr, "image/png")))
+                else:
+                    files.append(("image[]", (f"image_{i}.png", img_byte_arr, "image/png")))
+
+            if mask is not None:
+                if image.shape[0] != 1:
+                    raise Exception("Cannot use a mask with multiple image")
+                if mask.shape[1:] != image.shape[1:-1]:
+                    raise Exception("Mask and Image must be the same size")
+                _, height, width = mask.shape
+                rgba_mask = torch.zeros(height, width, 4, device="cpu")
+                rgba_mask[:, :, 3] = 1 - mask.squeeze().cpu()
+
+                scaled_mask = downscale_image_tensor(rgba_mask.unsqueeze(0), total_pixels=2048 * 2048).squeeze()
+
+                mask_np = (scaled_mask.numpy() * 255).astype(np.uint8)
+                mask_img = Image.fromarray(mask_np)
+                mask_img_byte_arr = BytesIO()
+                mask_img.save(mask_img_byte_arr, format="PNG")
+                mask_img_byte_arr.seek(0)
+                files.append(("mask", ("mask.png", mask_img_byte_arr, "image/png")))
+
+            response = await sync_op(
+                cls,
+                ApiEndpoint(
+                    path=urljoin(normalized_base_url, "images/edits"),
+                    method="POST",
+                    headers=headers,
+                ),
+                response_model=OpenAIImageGenerationResponse,
+                data=OpenAIImageEditRequest(
+                    model=model,
+                    prompt=prompt,
+                    quality=quality,
+                    background=background,
+                    n=n,
+                    seed=seed,
+                    size=size,
+                    moderation="low",
+                ),
+                content_type="multipart/form-data",
+                files=files,
+                price_extractor=price_extractor,
+            )
+        else:
+            response = await sync_op(
+                cls,
+                ApiEndpoint(
+                    path=urljoin(normalized_base_url, "images/generations"),
+                    method="POST",
+                    headers=headers,
+                ),
+                response_model=OpenAIImageGenerationResponse,
+                data=OpenAIImageGenerationRequest(
+                    model=model,
+                    prompt=prompt,
+                    quality=quality,
+                    background=background,
+                    n=n,
+                    seed=seed,
+                    size=size,
+                    moderation="low",
+                ),
+                price_extractor=price_extractor,
+            )
+        return IO.NodeOutput(await validate_and_cast_response(response))
+
+
 class OpenAIChatNode(IO.ComfyNode):
     """
     Node to generate text responses from an OpenAI model.
@@ -948,6 +1177,7 @@ class OpenAIExtension(ComfyExtension):
             OpenAIDalle2,
             OpenAIDalle3,
             OpenAIGPTImage1,
+            OpenAIGPTImageCustomBaseURL,
             OpenAIChatNode,
             OpenAIInputFiles,
             OpenAIChatConfig,

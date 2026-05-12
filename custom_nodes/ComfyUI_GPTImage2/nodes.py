@@ -6,10 +6,12 @@ Supports:
   - Image-to-Image (via /v1/images/edits)
 """
 
+import asyncio
 import os
 import io
 import json
 import base64
+import functools
 import requests
 import urllib3
 import numpy as np
@@ -152,7 +154,7 @@ def np_to_pil(arr: np.ndarray) -> Image.Image:
 def call_images_generate(prompt: str, model: str = "gpt-image-2",
                           n: int = 1, quality: str = "medium",
                           size: str = "1024x1024", output_format: str = "png",
-                          seed: int = -1, timeout: int = 120) -> list[str]:
+                          seed: int = -1, timeout: int | None = None) -> list[str]:
     """Call POST /v1/images/generations and return list of base64 image strings."""
     cfg = get_config()
     base_url = cfg.get("base_url", os.environ.get(
@@ -195,7 +197,7 @@ def call_images_edit(prompt: str, image_b64_list: list[str],
                      n: int = 1, quality: str = "medium",
                      input_fidelity: str = "high",
                      size: str = "1024x1024", output_format: str = "png",
-                     seed: int = -1, timeout: int = 120) -> list[str]:
+                     seed: int = -1, timeout: int | None = None) -> list[str]:
     """Call POST /v1/images/edits and return list of base64 image strings."""
     cfg = get_config()
     base_url = cfg.get("base_url", os.environ.get(
@@ -273,7 +275,7 @@ def call_images_generate_with_refs(prompt: str, image_b64_list: list[str],
                                    model: str = "gpt-image-2",
                                    n: int = 1, quality: str = "medium",
                                    size: str = "1024x1024", output_format: str = "png",
-                                   seed: int = -1, timeout: int = 120) -> list[str]:
+                                   seed: int = -1, timeout: int | None = None) -> list[str]:
     """Gateway fallback: call POST /v1/images/generations with image references in JSON."""
     cfg = get_config()
     base_url = cfg.get("base_url", os.environ.get(
@@ -367,15 +369,20 @@ class GPTImage2Text2Img:
             }
         }
 
-    def generate(self, prompt, model, quality, size, n, seed, output_format="png"):
-        images = call_images_generate(
-            prompt=prompt,
-            model=model,
-            n=n,
-            quality=quality,
-            size=resolve_size(size),
-            seed=seed,
-            output_format=output_format,
+    async def generate(self, prompt, model, quality, size, n, seed, output_format="png"):
+        loop = asyncio.get_event_loop()
+        images = await loop.run_in_executor(
+            None,
+            functools.partial(
+                call_images_generate,
+                prompt=prompt,
+                model=model,
+                n=n,
+                quality=quality,
+                size=resolve_size(size),
+                seed=seed,
+                output_format=output_format,
+            ),
         )
 
         tensors = []
@@ -443,9 +450,9 @@ class GPTImage2Img2Img:
             }
         }
 
-    def transform(self, image1, prompt, model, input_fidelity,
-                  quality, size, n, seed, output_format="png",
-                  image2=None, image3=None, image4=None, image5=None):
+    async def transform(self, image1, prompt, model, input_fidelity,
+                        quality, size, n, seed, output_format="png",
+                        image2=None, image3=None, image4=None, image5=None):
         all_images = [image1, image2, image3, image4, image5]
         valid_images = []
         for img in all_images:
@@ -463,16 +470,21 @@ class GPTImage2Img2Img:
 
         image_b64_list = [image_to_base64(img) for img in valid_images]
 
-        images = call_images_edit(
-            prompt=prompt,
-            image_b64_list=image_b64_list,
-            model=model,
-            n=n,
-            input_fidelity=input_fidelity,
-            quality=quality,
-            size=resolve_size(size),
-            seed=seed,
-            output_format=output_format,
+        loop = asyncio.get_event_loop()
+        images = await loop.run_in_executor(
+            None,
+            functools.partial(
+                call_images_edit,
+                prompt=prompt,
+                image_b64_list=image_b64_list,
+                model=model,
+                n=n,
+                input_fidelity=input_fidelity,
+                quality=quality,
+                size=resolve_size(size),
+                seed=seed,
+                output_format=output_format,
+            ),
         )
 
         tensors = []
@@ -536,8 +548,8 @@ class GPTImageNode:
             },
         }
 
-    def generate(self, prompt, model, api_key, quality, size, background,
-                 output_format, output_compression, n_images):
+    async def generate(self, prompt, model, api_key, quality, size, background,
+                       output_format, output_compression, n_images):
         cfg = get_config()
         base_url = cfg.get("base_url", os.environ.get(
             "GPTIMAGE2_BASE_URL", "https://api.bltcy.ai/v1")).rstrip("/")
@@ -561,22 +573,28 @@ class GPTImageNode:
         if background != "auto":
             payload["background"] = background
 
-        resp = get_http_session().post(
-            f"{base_url}/images/generations",
-            headers=headers,
-            json=payload,
-            timeout=180,
-        )
-        print(f"[GPTImageNode] Status: {resp.status_code}, Body: {resp.text[:500]}")
-        resp.raise_for_status()
-        data = resp.json()
+        def _do_request():
+            resp = get_http_session().post(
+                f"{base_url}/images/generations",
+                headers=headers,
+                json=payload,
+                timeout=None,
+            )
+            print(f"[GPTImageNode] Status: {resp.status_code}, Body: {resp.text[:500]}")
+            resp.raise_for_status()
+            return resp.json()
+
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, _do_request)
 
         tensors = []
         for item in data.get("data", []):
             if "b64_json" in item:
                 b64 = item["b64_json"]
             elif "url" in item:
-                img_resp = get_http_session().get(item["url"], timeout=120)
+                img_resp = await loop.run_in_executor(
+                    None, functools.partial(get_http_session().get, item["url"], timeout=None)
+                )
                 img_resp.raise_for_status()
                 b64 = base64.b64encode(img_resp.content).decode("utf-8")
             else:

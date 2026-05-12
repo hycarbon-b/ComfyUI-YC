@@ -2,24 +2,20 @@
 ComfyUI Custom OpenAI Node with Customizable Base URL and API Key
 Provides GPT Image generation with custom OpenAI-compatible API endpoints
 """
+import asyncio
 import base64
+import functools
 from io import BytesIO
 from urllib.parse import urljoin
 
 import numpy as np
+import requests as _requests
 import torch
 from PIL import Image
 
 from comfy_api.latest import IO, Input
-from comfy_api_nodes.apis.openai import (
-    OpenAIImageEditRequest,
-    OpenAIImageGenerationRequest,
-    OpenAIImageGenerationResponse,
-)
 from comfy_api_nodes.util import (
-    ApiEndpoint,
     downscale_image_tensor,
-    sync_op,
     validate_string,
 )
 
@@ -208,109 +204,104 @@ class OpenAIGPTImageCustom(IO.ComfyNode):
         if mask is not None and image is None:
             raise ValueError("Cannot use a mask without an input image")
 
-        if model in ("gpt-image-1", "gpt-image-1.5"):
-            if size not in ("auto", "1024x1024", "1024x1536", "1536x1024"):
-                raise ValueError(f"Resolution {size} is only supported by GPT Image 2 model")
-
-        if model == "gpt-image-1":
-            price_extractor = calculate_tokens_price_image_1
-        elif model == "gpt-image-1.5":
-            price_extractor = calculate_tokens_price_image_1_5
-        elif model == "gpt-image-2":
-            price_extractor = calculate_tokens_price_image_2_0
-            if background == "transparent":
-                raise ValueError("Transparent background is not supported for GPT Image 2 model")
-        else:
-            raise ValueError(f"Unknown model: {model}")
-
-        # Normalize base URL and prepare headers
-        normalized_base_url = base_url.strip().rstrip("/") + "/"
-        headers: dict[str, str] = {
-            "Authorization": f"Bearer {api_key.strip()}",
-        }
+        normalized_base_url = base_url.strip().rstrip("/")
+        headers = {"Authorization": f"Bearer {api_key.strip()}"}
 
         if image is not None:
-            # Image editing mode
+            # Build multipart files list
             files = []
             batch_size = image.shape[0]
             for i in range(batch_size):
                 single_image = image[i : i + 1]
                 scaled_image = downscale_image_tensor(single_image, total_pixels=2048 * 2048).squeeze()
-
                 image_np = (scaled_image.numpy() * 255).astype(np.uint8)
-                img = Image.fromarray(image_np)
-                img_byte_arr = BytesIO()
-                img.save(img_byte_arr, format="PNG")
-                img_byte_arr.seek(0)
-
-                if batch_size == 1:
-                    files.append(("image", (f"image_{i}.png", img_byte_arr, "image/png")))
-                else:
-                    files.append(("image[]", (f"image_{i}.png", img_byte_arr, "image/png")))
+                img_buf = BytesIO()
+                Image.fromarray(image_np).save(img_buf, format="PNG")
+                field = "image" if batch_size == 1 else "image[]"
+                files.append((field, (f"image_{i}.png", img_buf.getvalue(), "image/png")))
 
             if mask is not None:
                 if image.shape[0] != 1:
-                    raise Exception("Cannot use a mask with multiple images")
-                if mask.shape[1:] != image.shape[1:-1]:
-                    raise Exception("Mask and Image must be the same size")
+                    raise ValueError("Cannot use a mask with multiple images")
                 _, height, width = mask.shape
                 rgba_mask = torch.zeros(height, width, 4, device="cpu")
                 rgba_mask[:, :, 3] = 1 - mask.squeeze().cpu()
-
                 scaled_mask = downscale_image_tensor(rgba_mask.unsqueeze(0), total_pixels=2048 * 2048).squeeze()
-
                 mask_np = (scaled_mask.numpy() * 255).astype(np.uint8)
-                mask_img = Image.fromarray(mask_np)
-                mask_img_byte_arr = BytesIO()
-                mask_img.save(mask_img_byte_arr, format="PNG")
-                mask_img_byte_arr.seek(0)
-                files.append(("mask", ("mask.png", mask_img_byte_arr, "image/png")))
+                mask_buf = BytesIO()
+                Image.fromarray(mask_np).save(mask_buf, format="PNG")
+                files.append(("mask", ("mask.png", mask_buf.getvalue(), "image/png")))
 
-            response = await sync_op(
-                cls,
-                ApiEndpoint(
-                    path=urljoin(normalized_base_url, "images/edits"),
-                    method="POST",
+            # Append text fields
+            files += [
+                ("prompt", (None, prompt)),
+                ("model",  (None, model)),
+                ("n",      (None, str(n))),
+                ("quality",(None, quality)),
+                ("size",   (None, size)),
+                ("seed",   (None, str(seed))),
+            ]
+            if background != "auto":
+                files.append(("background", (None, background)))
+
+            def _do_edit():
+                resp = _requests.post(
+                    f"{normalized_base_url}/images/edits",
                     headers=headers,
-                ),
-                response_model=OpenAIImageGenerationResponse,
-                data=OpenAIImageEditRequest(
-                    model=model,
-                    prompt=prompt,
-                    quality=quality,
-                    background=background,
-                    n=n,
-                    seed=seed,
-                    size=size,
-                    moderation="low",
-                ),
-                content_type="multipart/form-data",
-                files=files,
-                price_extractor=price_extractor,
-            )
+                    files=files,
+                    timeout=None,
+                    proxies={},  # bypass system proxy
+                )
+                print(f"[OpenAICustom] edits status={resp.status_code} body={resp.text[:300]}")
+                resp.raise_for_status()
+                return resp.json()
+
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, _do_edit)
         else:
-            # Text-to-image mode
-            response = await sync_op(
-                cls,
-                ApiEndpoint(
-                    path=urljoin(normalized_base_url, "images/generations"),
-                    method="POST",
-                    headers=headers,
-                ),
-                response_model=OpenAIImageGenerationResponse,
-                data=OpenAIImageGenerationRequest(
-                    model=model,
-                    prompt=prompt,
-                    quality=quality,
-                    background=background,
-                    n=n,
-                    seed=seed,
-                    size=size,
-                    moderation="low",
-                ),
-                price_extractor=price_extractor,
-            )
-        return IO.NodeOutput(await validate_and_cast_response(response))
+            payload = {
+                "model": model, "prompt": prompt, "n": n,
+                "quality": quality, "size": size, "seed": seed,
+            }
+            if background != "auto":
+                payload["background"] = background
+
+            def _do_gen():
+                resp = _requests.post(
+                    f"{normalized_base_url}/images/generations",
+                    headers={**headers, "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=None,
+                    proxies={},  # bypass system proxy
+                )
+                print(f"[OpenAICustom] gen status={resp.status_code} body={resp.text[:300]}")
+                resp.raise_for_status()
+                return resp.json()
+
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, _do_gen)
+
+        # Decode response images into tensors
+        tensors = []
+        for item in data.get("data", []):
+            if item.get("b64_json"):
+                img_bytes = base64.b64decode(item["b64_json"])
+            elif item.get("url"):
+                r = await loop.run_in_executor(
+                    None,
+                    functools.partial(_requests.get, item["url"], timeout=None, proxies={}),
+                )
+                r.raise_for_status()
+                img_bytes = r.content
+            else:
+                continue
+            pil_img = Image.open(BytesIO(img_bytes)).convert("RGBA")
+            arr = np.asarray(pil_img).astype(np.float32) / 255.0
+            tensors.append(torch.from_numpy(arr))
+
+        if not tensors:
+            raise ValueError("No images returned from API")
+        return IO.NodeOutput(torch.stack(tensors, dim=0))
 
 
 # Node mapping for ComfyUI

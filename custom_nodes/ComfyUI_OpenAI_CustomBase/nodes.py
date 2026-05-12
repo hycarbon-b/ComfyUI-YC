@@ -101,7 +101,7 @@ class OpenAIGPTImageCustom(IO.ComfyNode):
                 ),
                 IO.String.Input(
                     "base_url",
-                    default="https://gw-stg.tradingbase.ai/v1",
+                    default="https://api.laozhang.ai/v1",
                     tooltip="OpenAI-compatible API base URL",
                 ),
                 IO.String.Input(
@@ -190,7 +190,7 @@ class OpenAIGPTImageCustom(IO.ComfyNode):
     async def execute(
         cls,
         prompt: str,
-        base_url: str = "https://gw-stg.tradingbase.ai/v1",
+        base_url: str = "https://api.laozhang.ai/v1",
         api_key: str = "sk-doKcKuvmFoM7RAARaNO1Uyda4e6mJUGt0CIW3Y8B4oC5Xtlx",
         seed: int = 0,
         quality: str = "low",

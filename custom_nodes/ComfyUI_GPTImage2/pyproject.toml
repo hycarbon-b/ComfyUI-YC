@@ -1,0 +1,21 @@
+[project]
+name = "comfyui-gptimage2"
+description = "ComfyUI nodes for GPT-Image-2 API: text-to-image, image-to-image, and image editing"
+version = "1.0.0"
+license = {text = "MIT"}
+# classifiers = [
+#     "Operating System :: OS Independent",
+#     "Environment :: GPU :: NVIDIA CUDA",
+# ]
+
+dependencies = ["requests>=2.28.0", "Pillow>=9.0.0", "numpy>=1.23.0"]
+
+[project.urls]
+Repository = "https://github.com/YOUR_USERNAME/ComfyUI_GPTImage2"
+# Documentation = "https://github.com/YOUR_USERNAME/ComfyUI_GPTImage2/wiki"
+# "Bug Tracker" = "https://github.com/YOUR_USERNAME/ComfyUI_GPTImage2/issues"
+
+[tool.comfy]
+PublisherId = "YOUR_PUBLISHER_ID"
+DisplayName = "ComfyUI_GPTImage2"
+Icon = ""

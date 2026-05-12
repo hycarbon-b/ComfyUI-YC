@@ -239,23 +239,6 @@ def call_images_edit(prompt: str, image_b64_list: list[str],
         timeout=timeout,
     )
     print(f"[GPTImage2] Status: {resp.status_code}, Body: {resp.text[:500]}")
-    if not resp.ok:
-        error_message = parse_error_message(resp)
-        if "only application/json support" in error_message or "failed to parse multipart form" in error_message:
-            # Gateway fallback: some OpenAI-compatible gateways only allow JSON and route
-            # image-to-image through /images/generations with image/image[] data URLs.
-            return call_images_generate_with_refs(
-                prompt=prompt,
-                image_b64_list=image_b64_list,
-                mask_b64=mask_b64,
-                model=model,
-                n=n,
-                quality=quality,
-                size=size,
-                output_format=output_format,
-                seed=seed,
-                timeout=timeout,
-            )
     resp.raise_for_status()
     data = resp.json()
 

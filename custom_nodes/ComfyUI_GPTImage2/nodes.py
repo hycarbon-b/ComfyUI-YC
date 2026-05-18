@@ -29,6 +29,7 @@ LEGACY_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 CONFIG_FILE_NAME = "config.json"
 CONFIG_DIRECTORY_NAME = "gptimage2"
 CONFIG_KEYS = ("base_url", "api_key")
+API_KEY_ALIASES = ("api_key", "api_k")
 CONFIG_LOCK = threading.Lock()
 
 
@@ -83,23 +84,34 @@ def _default_config() -> dict:
     }
 
 
+def _read_config_file() -> dict:
+    if os.path.exists(LEGACY_CONFIG_PATH):
+        return _read_json_file(LEGACY_CONFIG_PATH)
+    return _read_json_file(get_config_path())
+
+
+def _resolve_api_key(stored: dict) -> str:
+    for key in API_KEY_ALIASES:
+        value = _clean_string(stored.get(key))
+        if value:
+            return value
+    return ""
+
+
 def _merge_config(stored: dict) -> dict:
     config = _default_config()
-    for key in CONFIG_KEYS:
-        if key not in stored:
-            continue
-        if key == "base_url":
-            value = _normalize_base_url(stored.get(key))
-            if value:
-                config[key] = value
-            continue
-        value = _clean_string(stored.get(key))
-        if value or key == "api_key":
-            config[key] = value
+    base_url = _normalize_base_url(stored.get("base_url"))
+    if base_url:
+        config["base_url"] = base_url
+    api_key = _resolve_api_key(stored)
+    if api_key or any(key in stored for key in API_KEY_ALIASES):
+        config["api_key"] = api_key
     return config
 
 
 def _ensure_config_migrated() -> str:
+    if os.path.exists(LEGACY_CONFIG_PATH):
+        return LEGACY_CONFIG_PATH
     config_path = get_config_path()
     if os.path.exists(config_path):
         return config_path
@@ -110,27 +122,26 @@ def _ensure_config_migrated() -> str:
 
 
 def get_config() -> dict:
-    return _merge_config(_read_json_file(_ensure_config_migrated()))
+    return _merge_config(_read_config_file())
 
 
 def save_config(updates: dict) -> dict:
     config_path = _ensure_config_migrated()
     with CONFIG_LOCK:
         stored = _read_json_file(config_path)
-        merged = _merge_config(stored)
-        for key in CONFIG_KEYS:
-            if key not in updates:
-                continue
-            if key == "base_url":
-                value = _normalize_base_url(updates[key])
-                if value:
-                    merged[key] = value
-                continue
-            value = _clean_string(updates[key])
-            if value or key == "api_key":
-                merged[key] = value
-        _write_json_file(config_path, merged)
-    return merged
+        next_config = dict(stored)
+        if "base_url" in updates:
+            value = _normalize_base_url(updates["base_url"])
+            if value:
+                next_config["base_url"] = value
+        if "api_key" in updates:
+            value = _clean_string(updates["api_key"])
+            if "api_k" in next_config and "api_key" not in next_config:
+                next_config["api_k"] = value
+            else:
+                next_config["api_key"] = value
+        _write_json_file(config_path, next_config)
+    return _merge_config(next_config)
 
 
 def build_request_settings(base_url: str = "", api_key: str = "", persist_settings: bool = False) -> tuple[str, str]:

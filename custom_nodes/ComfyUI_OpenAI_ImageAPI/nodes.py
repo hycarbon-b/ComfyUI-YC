@@ -24,10 +24,10 @@ from typing import Any
 import numpy as np
 import requests as _requests
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 from comfy_api.latest import IO, Input
-from comfy_api_nodes.util import downscale_image_tensor, validate_string
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -38,6 +38,32 @@ _MAX_PIXELS = 2048 * 2048  # largest safe size before API rejects the upload
 # One shared session reuses TCP connections across concurrent requests.
 _session = _requests.Session()
 _session.trust_env = False  # ignore system proxy env vars
+
+
+def validate_string(value: str, strip_whitespace: bool = True, min_length: int = 0) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Expected a string value")
+    processed = value.strip() if strip_whitespace else value
+    if len(processed) < min_length:
+        raise ValueError(f"String is shorter than minimum length {min_length}")
+    return processed
+
+
+def downscale_image_tensor(image: torch.Tensor, total_pixels: int) -> torch.Tensor:
+    """Downscale NHWC tensor to fit total_pixels while keeping aspect ratio."""
+    if image.ndim != 4:
+        return image
+    n, h, w, c = image.shape
+    if h * w <= total_pixels:
+        return image
+
+    scale = (float(total_pixels) / float(h * w)) ** 0.5
+    new_h = max(1, int(round(h * scale)))
+    new_w = max(1, int(round(w * scale)))
+
+    nchw = image.permute(0, 3, 1, 2)
+    resized = F.interpolate(nchw, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    return resized.permute(0, 2, 3, 1)
 
 
 def _pil_to_png_bytes(pil_img: Image.Image) -> bytes:

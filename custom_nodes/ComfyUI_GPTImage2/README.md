@@ -1,39 +1,29 @@
 # ComfyUI GPTImage2
 
-Community-ready ComfyUI nodes for GPT Image APIs.
+[![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-blue)](https://github.com/comfyanonymous/ComfyUI)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-This plugin provides:
-- Text-to-image generation (`/v1/images/generations`)
-- Image-to-image editing (`/v1/images/edits`)
-- Gateway-compatible fallback for edit flows when multipart is blocked
+Production-oriented ComfyUI nodes for GPT image providers.
 
-## Features
+This extension focuses on practical gateway compatibility: configurable base URL, independent model routing for generation and editing, and robust edit fallback behavior.
 
-- OpenAI-compatible API support with custom `base_url` + `api_key`
-- Configurable GPT image model names for both generation and edit flows
-- Separate model names for Image Gen and Image Edit to avoid same-name routing bugs on some gateways
-- Multi-image generation support without sequential waiting (batch generation in one request)
-- Multi-image references for image editing
-- Editable model name for image edit (default: `gpt-image-2-edit`)
-- Optional fallback from `/images/edits` to `/images/generations` for restricted gateways
-- Aspect-ratio presets with automatic size conversion
+## Highlights
+
+- Custom `base_url` and `api_key` for OpenAI-compatible providers
+- Separate model names for Image Gen and Image Edit
+- Concurrent multi-image generation support (no serial waiting)
+- `Img2Img` supports multi-reference input (`image1..image5`)
+- Automatic gateway fallback for edit requests when multipart is blocked
+- Aspect-ratio helper node for prompt workflows
+
+## Why Separate Gen/Edit Models?
+
+Some gateways route `/images/generations` and `/images/edits` differently. Using the same model name for both endpoints may cause provider-side forwarding bugs. This plugin lets you set generation and edit model names independently to avoid those issues.
 
 ## Installation
 
-### Option 1: Manual install
-
-1. Copy this folder into `ComfyUI/custom_nodes/ComfyUI_GPTImage2`
-2. Install dependencies:
-
-```bash
-cd ComfyUI/custom_nodes/ComfyUI_GPTImage2
-pip install -r requirements.txt
-```
-
-3. Configure API settings in `config.json`
-4. Restart ComfyUI
-
-### Option 2: Git clone
+### Method A: Existing ComfyUI (recommended)
 
 ```bash
 cd ComfyUI/custom_nodes
@@ -42,85 +32,66 @@ cd ComfyUI-YC/custom_nodes/ComfyUI_GPTImage2
 pip install -r requirements.txt
 ```
 
-Then restart ComfyUI.
+Restart ComfyUI after installation.
 
-## Configuration
+### Method B: Copy Folder
 
-Edit `config.json`:
+1. Copy this directory to `ComfyUI/custom_nodes/ComfyUI_GPTImage2`
+2. Run `pip install -r requirements.txt` in that directory
+3. Restart ComfyUI
+
+## Quick Configuration
+
+Create or edit `config.json`:
 
 ```json
 {
-  "base_url": "https://api.bltcy.ai/v1",
+  "base_url": "https://api.your-provider.com/v1",
   "api_key": "YOUR_API_KEY",
   "edit_model": "gpt-image-2-edit"
 }
 ```
 
-Environment variables are also supported:
+Environment variable overrides:
+
 - `GPTIMAGE2_BASE_URL`
 - `GPTIMAGE2_API_KEY`
 - `GPTIMAGE2_EDIT_MODEL`
 
-Model configuration note:
-- You can set model names independently for Text2Img and Img2Img/Edit nodes.
-- `edit_model` in `config.json` provides a default for edit requests.
+## Node Overview
 
-## Nodes
+| Node | Purpose | Model Input | Notes |
+|---|---|---|---|
+| `GPT_Image Text2Img` | Text to image | Per-node `model` | Supports `n` for multi-image generation |
+| `GPT_Image Img2Img` | Image edit / transform | Per-node `model` + config fallback | Supports `image1..image5` references |
+| `GPT_比例提示词` | Prompt aspect helper | N/A | Ratio-aware prompt enhancement |
 
-### GPT_Image Text2Img
+## Provider Compatibility Requirements
 
-Generate image(s) from a prompt.
+Your provider should expose both endpoints:
 
-Key inputs:
-- `prompt`
-- `model` (`gpt-image-2`, `gpt-image-1.5`, `gpt-image-1`)
-- `quality` (`low`, `medium`, `high`, `auto`)
-- `size` (ratio presets + `auto`)
-- `n`, `seed`, `output_format`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
 
-### GPT_Image Img2Img
+Recommended:
 
-Edit an input image with prompt guidance.
+- Allow different model names per endpoint (Gen vs Edit)
+- Proper multipart support for edit requests
 
-Key inputs:
-- `image1` (required), optional `image2..image5`
-- `prompt` (required)
-- `model` (free text, default `gpt-image-2-edit`)
-- `input_fidelity`, `quality`, `size`, `n`, `seed`, `output_format`
+If multipart edit is blocked by the gateway, plugin fallback logic can route via generation-style JSON references where available.
 
-Notes:
-- Reference images are uploaded individually (no local sprite stitching).
-- For `gpt-image-2*` models, `input_fidelity` is omitted automatically.
+## Troubleshooting
 
-## Gateway Compatibility
+- `model_price_error`: configure model pricing/routing on your provider
+- `invalid_image_request`: provider may reject multipart edit payloads
+- Empty output: verify API key, quota, endpoint availability, and model access
 
-Some API gateways block `multipart/form-data` for `/images/edits`.
+When opening an issue, include:
 
-This plugin detects that failure path and can fallback to JSON references through `/images/generations`, including an automatic transparent mask for better compatibility.
-
-Provider requirement:
-- Your provider must expose both Image Generation and Image Edit endpoints.
-- The two endpoints should support separately configurable model names.
-
-## Installation Support
-
-If installation fails, check in this order:
-
-1. **Python environment**: install dependencies inside the same Python used by ComfyUI
-2. **Node loading**: confirm `ComfyUI_GPTImage2` is under `ComfyUI/custom_nodes`
-3. **API config**: verify `base_url` and `api_key` are valid
-4. **Model access**: ensure your gateway account has model routing and pricing configured
-
-If you still need help, open an issue with:
 - ComfyUI version
-- Full node error traceback
-- Your gateway type (OpenAI direct / proxy / one-api style)
+- Full traceback
+- Provider/gateway type
 - Whether `/images/edits` accepts multipart
-
-## Known Issues
-
-- If your gateway returns pricing errors (for example `model_price_error`), configure model pricing on the gateway first.
-- If only JSON is accepted for edit endpoint but backend expects multipart, this is a gateway-side misconfiguration.
 
 ## Roadmap
 
@@ -128,7 +99,7 @@ If you still need help, open an issue with:
 - Add Response API support
 - Improve automatic gateway capability detection
 
-PRs are welcome.
+PRs are welcome for new providers and endpoint integrations.
 
 ## License
 

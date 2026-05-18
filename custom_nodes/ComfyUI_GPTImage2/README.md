@@ -9,7 +9,10 @@ This plugin provides:
 
 ## Features
 
-- OpenAI-compatible API support (base URL + API key)
+- OpenAI-compatible API support with custom `base_url` + `api_key`
+- Configurable GPT image model names for both generation and edit flows
+- Separate model names for Image Gen and Image Edit to avoid same-name routing bugs on some gateways
+- Multi-image generation support without sequential waiting (batch generation in one request)
 - Multi-image references for image editing
 - Editable model name for image edit (default: `gpt-image-2-edit`)
 - Optional fallback from `/images/edits` to `/images/generations` for restricted gateways
@@ -58,6 +61,10 @@ Environment variables are also supported:
 - `GPTIMAGE2_API_KEY`
 - `GPTIMAGE2_EDIT_MODEL`
 
+Model configuration note:
+- You can set model names independently for Text2Img and Img2Img/Edit nodes.
+- `edit_model` in `config.json` provides a default for edit requests.
+
 ## Nodes
 
 ### GPT_Image Text2Img
@@ -91,6 +98,10 @@ Some API gateways block `multipart/form-data` for `/images/edits`.
 
 This plugin detects that failure path and can fallback to JSON references through `/images/generations`, including an automatic transparent mask for better compatibility.
 
+Provider requirement:
+- Your provider must expose both Image Generation and Image Edit endpoints.
+- The two endpoints should support separately configurable model names.
+
 ## Installation Support
 
 If installation fails, check in this order:
@@ -110,6 +121,14 @@ If you still need help, open an issue with:
 
 - If your gateway returns pricing errors (for example `model_price_error`), configure model pricing on the gateway first.
 - If only JSON is accepted for edit endpoint but backend expects multipart, this is a gateway-side misconfiguration.
+
+## Roadmap
+
+- Support more provider-specific image endpoints
+- Add Response API support
+- Improve automatic gateway capability detection
+
+PRs are welcome.
 
 ## License
 

@@ -35,6 +35,11 @@ def get_config():
     return {"base_url": base_url, "api_key": api_key}
 
 
+def get_default_edit_model() -> str:
+    cfg = get_config()
+    return cfg.get("edit_model") or os.environ.get("GPTIMAGE2_EDIT_MODEL", "gpt-image-2-edit")
+
+
 def get_headers():
     cfg = get_config()
     api_key = cfg.get("api_key", os.environ.get("GPTIMAGE2_API_KEY", ""))
@@ -193,7 +198,7 @@ def call_images_generate(prompt: str, model: str = "gpt-image-2",
 
 def call_images_edit(prompt: str, image_b64_list: list[str],
                      mask_b64: str | None = None,
-                     model: str = "gpt-image-2",
+                     model: str = "gpt-image-2-edit",
                      n: int = 1, quality: str = "medium",
                      input_fidelity: str = "high",
                      size: str = "1024x1024", output_format: str = "png",
@@ -205,6 +210,8 @@ def call_images_edit(prompt: str, image_b64_list: list[str],
 
     if not image_b64_list:
         raise ValueError("At least one input image is required for image edits.")
+
+    model = (model or "").strip() or get_default_edit_model()
 
     files = [
         ("prompt", (None, prompt)),
@@ -403,8 +410,9 @@ class GPTImage2Img2Img:
                     "default": "Transform this image into a painting",
                     "placeholder": "Describe how to transform the image...",
                 }),
-                "model": (["gpt-image-2", "gpt-image-1.5", "gpt-image-1"], {
-                    "default": "gpt-image-2",
+                "model": ("STRING", {
+                    "default": "gpt-image-2-edit",
+                    "placeholder": "Edit model name, e.g. gpt-image-2-edit",
                 }),
                 "input_fidelity": (["low", "high"], {
                     "default": "high",

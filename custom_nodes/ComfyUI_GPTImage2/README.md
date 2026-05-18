@@ -6,13 +6,14 @@
 
 Production-oriented ComfyUI nodes for GPT image providers.
 
-This extension focuses on practical gateway compatibility: configurable base URL, persistent credential settings, visible HTTP status feedback, and parallel task execution wrapped inside a single ComfyUI node run.
+This extension focuses on the two core GPT image workflows: text-to-image and image-to-text. The node surface stays intentionally small while keeping configurable gateway settings, visible HTTP status feedback, and batched execution support inside a single ComfyUI node run.
 
 ## Highlights
 
 - Custom `base_url` and `api_key` for OpenAI-compatible providers
-- Only two nodes: Text2Img and Img2Img
-- Parallel execution for prompt lists, split-line prompts, and image batches inside one node execution
+- Only two nodes: Text2Img and Img2Text
+- Minimal inputs: prompt/image plus base URL, API key, and persistence toggle
+- Parallel execution for ComfyUI list/batch inputs inside one node execution
 - Visible request status output such as `SENT`, `HTTP 200`, and `HTTP 403`
 - Output node previews all generated images directly in ComfyUI
 
@@ -46,8 +47,7 @@ Example:
 ```json
 {
   "base_url": "https://gw-stg.tradingbase.ai/v1",
-  "api_key": "YOUR_API_KEY",
-  "edit_model": "gpt-image-2-edit"
+  "api_key": "YOUR_API_KEY"
 }
 ```
 
@@ -55,27 +55,24 @@ Environment variable overrides:
 
 - `GPTIMAGE2_BASE_URL`
 - `GPTIMAGE2_API_KEY`
-- `GPTIMAGE2_EDIT_MODEL`
-
 ## Node Overview
 
 | Node | Purpose | Model Input | Notes |
 |---|---|---|---|
-| `GPT_Image 文生图` | Text to image | Per-node `model` | Can split prompt lines into parallel tasks and returns an extra status text output |
-| `GPT_Image 图生图` | Image edit / transform | Per-node `model` | Supports `image1..image5`, image batch fan-out, prompt splitting, and parallel requests |
+| `GPT_Image 文生图` | Text to image | Fixed default | Returns generated images plus status text |
+| `GPT_Image 图生文` | Image to text | Fixed default | Supports image batch fan-out and returns extracted text plus status text |
 
 ## Provider Compatibility Requirements
 
 Your provider should expose both endpoints:
 
 - `POST /v1/images/generations`
-- `POST /v1/images/edits`
+- `POST /v1/chat/completions`
 
 Recommended:
 
-- Proper multipart support for edit requests
 - OpenAI-compatible `POST /v1/images/generations`
-- OpenAI-compatible `POST /v1/images/edits`
+- OpenAI-compatible vision input for `POST /v1/chat/completions`
 
 ## Troubleshooting
 
@@ -88,7 +85,7 @@ When opening an issue, include:
 - ComfyUI version
 - Full traceback
 - Provider/gateway type
-- Whether `/images/edits` accepts multipart
+- Whether `/chat/completions` accepts vision image inputs
 
 ## License
 

@@ -1,4 +1,4 @@
-"""ComfyUI custom nodes for GPT image text-to-image and image-to-image."""
+"""ComfyUI custom nodes for GPT image text-to-image and image-to-text."""
 
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 

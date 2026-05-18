@@ -23,11 +23,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PLUGIN_CATEGORY = "YC/GPT Image"
 DEFAULT_BASE_URL = "https://gw-stg.tradingbase.ai/v1"
-DEFAULT_EDIT_MODEL = "gpt-image-2-edit"
+DEFAULT_GENERATE_MODEL = "gpt-image-2"
+DEFAULT_VISION_MODEL = "gpt-4o-mini"
 LEGACY_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 CONFIG_FILE_NAME = "config.json"
 CONFIG_DIRECTORY_NAME = "gptimage2"
-CONFIG_KEYS = ("base_url", "api_key", "edit_model")
+CONFIG_KEYS = ("base_url", "api_key")
 CONFIG_LOCK = threading.Lock()
 
 
@@ -79,7 +80,6 @@ def _default_config() -> dict:
     return {
         "base_url": _normalize_base_url(os.environ.get("GPTIMAGE2_BASE_URL")) or DEFAULT_BASE_URL,
         "api_key": _clean_string(os.environ.get("GPTIMAGE2_API_KEY")),
-        "edit_model": _clean_string(os.environ.get("GPTIMAGE2_EDIT_MODEL")) or DEFAULT_EDIT_MODEL,
     }
 
 
@@ -131,10 +131,6 @@ def save_config(updates: dict) -> dict:
                 merged[key] = value
         _write_json_file(config_path, merged)
     return merged
-
-
-def get_default_edit_model() -> str:
-    return get_config().get("edit_model") or DEFAULT_EDIT_MODEL
 
 
 def build_request_settings(base_url: str = "", api_key: str = "", persist_settings: bool = False) -> tuple[str, str]:
@@ -190,26 +186,6 @@ def get_http_session():
     return _http_session
 
 
-ASPECT_RATIOS = {
-    "1:1": (1024, 1024),
-    "4:3": (1024, 768),
-    "3:2": (1024, 682),
-    "16:9": (1280, 720),
-    "21:9": (1680, 720),
-    "2:3": (768, 1152),
-    "3:4": (768, 1024),
-    "9:16": (768, 1365),
-    "9:21": (720, 1680),
-}
-
-
-def resolve_size(size: str) -> str:
-    if size in ASPECT_RATIOS:
-        width, height = ASPECT_RATIOS[size]
-        return f"{width}x{height}"
-    return size
-
-
 def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
     buffer = io.BytesIO()
     img.save(buffer, format=fmt)
@@ -243,13 +219,6 @@ def _pick_list_value(values, index: int):
 def _max_list_length(*values) -> int:
     lengths = [len(value) for value in values if isinstance(value, list)]
     return max(lengths, default=1)
-
-
-def _expand_prompt_tasks(prompt_value: str, split_prompts: bool) -> list[str]:
-    if not split_prompts:
-        return [prompt_value]
-    prompts = [line.strip() for line in prompt_value.splitlines() if line.strip()]
-    return prompts or [prompt_value]
 
 
 def _b64_to_tensor(image_b64: str) -> torch.Tensor:
@@ -330,6 +299,24 @@ def extract_response_images(data: dict, timeout: int | None = None) -> tuple[lis
     return images, download_statuses
 
 
+def extract_response_text(data: dict) -> str:
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+    content = (choices[0].get("message") or {}).get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif isinstance(item, str):
+                parts.append(item)
+        return "\n".join(part.strip() for part in parts if part.strip())
+    return str(content).strip()
+
+
 def _save_preview_images(images: torch.Tensor, prefix: str) -> list[dict]:
     preview_node = comfy_nodes.PreviewImage()
     preview_node.prefix_append = f"_{prefix}_{uuid.uuid4().hex[:8]}"
@@ -363,10 +350,6 @@ def _build_result_payload(image_groups: list[dict], status_lines: list[str], pre
 def call_images_generate(
     prompt: str,
     model: str,
-    quality: str,
-    size: str,
-    output_format: str,
-    seed: int,
     base_url: str,
     api_key: str,
     persist_settings: bool,
@@ -380,10 +363,6 @@ def call_images_generate(
         json_payload={
             "model": model,
             "prompt": prompt,
-            "quality": quality,
-            "size": size,
-            "output_format": output_format,
-            "seed": seed,
         },
         timeout=timeout,
     )
@@ -393,49 +372,39 @@ def call_images_generate(
     return {"images": images, "status_lines": status_lines}
 
 
-def call_images_edit(
+def call_image_to_text(
     prompt: str,
-    image_b64_list: list[str],
-    model: str,
-    input_fidelity: str,
-    quality: str,
-    size: str,
-    output_format: str,
-    seed: int,
+    image_b64: str,
     base_url: str,
     api_key: str,
     persist_settings: bool,
     timeout: int | None = None,
 ) -> dict:
     resolved_base_url, resolved_api_key = build_request_settings(base_url, api_key, persist_settings)
-    if not image_b64_list:
-        raise ValueError("At least one input image is required for image edits.")
-
-    resolved_model = _clean_string(model) or get_default_edit_model()
-    files = [
-        ("prompt", (None, prompt)),
-        ("model", (None, resolved_model)),
-        ("quality", (None, quality)),
-        ("size", (None, size)),
-        ("output_format", (None, output_format)),
-        ("seed", (None, str(seed))),
-    ]
-    if input_fidelity and not resolved_model.lower().startswith("gpt-image-2"):
-        files.append(("input_fidelity", (None, input_fidelity)))
-    for index, image_b64 in enumerate(image_b64_list, start=1):
-        files.append(("image", (f"image{index}.png", base64.b64decode(image_b64), "image/png")))
+    if not image_b64:
+        raise ValueError("An input image is required for image-to-text.")
 
     response, status_lines = _request_with_status(
         "POST",
-        f"{resolved_base_url}/images/edits",
-        headers=build_headers(resolved_api_key, with_content_type=False),
-        files=files,
+        f"{resolved_base_url}/chat/completions",
+        headers=build_headers(resolved_api_key),
+        json_payload={
+            "model": DEFAULT_VISION_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    ],
+                }
+            ],
+        },
         timeout=timeout,
     )
-    images, download_statuses = extract_response_images(response.json(), timeout=timeout)
-    status_lines.extend(download_statuses)
-    status_lines.append(f"RECEIVED {len(images)} image(s)")
-    return {"images": images, "status_lines": status_lines}
+    text = extract_response_text(response.json())
+    status_lines.append("RECEIVED text response" if text else "RECEIVED empty text response")
+    return {"text": text, "status_lines": status_lines}
 
 
 async def _run_parallel_jobs(callables: list[functools.partial], unique_id: str | None) -> tuple[list[dict], list[str]]:
@@ -492,10 +461,6 @@ class GPTImage2Text2Img:
                     "default": "A beautiful landscape at sunset",
                     "placeholder": "Enter your prompt here...",
                 }),
-                "model": (["gpt-image-2", "gpt-image-1.5", "gpt-image-1"], {"default": "gpt-image-2"}),
-                "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
-                "size": (["1:1", "4:3", "3:2", "16:9", "21:9", "2:3", "3:4", "9:16", "9:21", "auto"], {"default": "auto"}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647, "step": 1}),
                 "base_url": ("STRING", {
                     "default": config.get("base_url", DEFAULT_BASE_URL),
                     "placeholder": "OpenAI-compatible base URL",
@@ -505,48 +470,38 @@ class GPTImage2Text2Img:
                     "placeholder": "Leave empty to use saved API key",
                 }),
                 "persist_settings": ("BOOLEAN", {"default": True}),
-                "split_prompts": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "output_format": (["png", "jpeg", "webp"], {"default": "png"}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
             },
         }
 
-    async def generate(self, prompt, model, quality, size, seed, base_url, api_key, persist_settings, split_prompts, unique_id, output_format=None):
-        task_count = _max_list_length(prompt, model, quality, size, seed, base_url, api_key, persist_settings, split_prompts, output_format or [])
+    async def generate(self, prompt, base_url, api_key, persist_settings, unique_id):
+        task_count = _max_list_length(prompt, base_url, api_key, persist_settings)
         callables = []
 
         for index in range(task_count):
             prompt_value = _clean_string(_pick_list_value(prompt, index))
             if not prompt_value:
                 raise ValueError("Prompt cannot be empty.")
-            prompts = _expand_prompt_tasks(prompt_value, bool(_pick_list_value(split_prompts, index)))
-            for single_prompt in prompts:
-                callables.append(functools.partial(
-                    call_images_generate,
-                    prompt=single_prompt,
-                    model=_pick_list_value(model, index),
-                    quality=_pick_list_value(quality, index),
-                    size=resolve_size(_pick_list_value(size, index)),
-                    output_format=_pick_list_value(output_format or ["png"], index),
-                    seed=int(_pick_list_value(seed, index)),
-                    base_url=_pick_list_value(base_url, index),
-                    api_key=_pick_list_value(api_key, index),
-                    persist_settings=bool(_pick_list_value(persist_settings, index)),
-                ))
+            callables.append(functools.partial(
+                call_images_generate,
+                prompt=prompt_value,
+                model=DEFAULT_GENERATE_MODEL,
+                base_url=_pick_list_value(base_url, index),
+                api_key=_pick_list_value(api_key, index),
+                persist_settings=bool(_pick_list_value(persist_settings, index)),
+            ))
 
         image_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
         return _build_result_payload(image_groups, status_lines, "gptimage2_text2img")
 
 
-class GPTImage2Img2Img:
+class GPTImage2Img2Text:
     CATEGORY = PLUGIN_CATEGORY
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("images", "status")
-    FUNCTION = "transform"
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("text", "status")
+    FUNCTION = "describe"
     OUTPUT_NODE = True
     INPUT_IS_LIST = True
 
@@ -558,17 +513,9 @@ class GPTImage2Img2Img:
                 "image1": ("IMAGE",),
                 "prompt": ("STRING", {
                     "multiline": True,
-                    "default": "Transform this image into a painting",
-                    "placeholder": "Describe how to transform the image...",
+                    "default": "Describe this image in detail.",
+                    "placeholder": "Ask what to extract from the image...",
                 }),
-                "model": ("STRING", {
-                    "default": get_default_edit_model(),
-                    "placeholder": "Edit model name, e.g. gpt-image-2-edit",
-                }),
-                "input_fidelity": (["low", "high"], {"default": "high"}),
-                "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
-                "size": (["1:1", "4:3", "3:2", "16:9", "21:9", "2:3", "3:4", "9:16", "9:21", "auto"], {"default": "auto"}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647, "step": 1}),
                 "base_url": ("STRING", {
                     "default": config.get("base_url", DEFAULT_BASE_URL),
                     "placeholder": "OpenAI-compatible base URL",
@@ -578,100 +525,68 @@ class GPTImage2Img2Img:
                     "placeholder": "Leave empty to use saved API key",
                 }),
                 "persist_settings": ("BOOLEAN", {"default": True}),
-                "split_prompts": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "image2": ("IMAGE",),
-                "image3": ("IMAGE",),
-                "image4": ("IMAGE",),
-                "image5": ("IMAGE",),
-                "output_format": (["png", "jpeg", "webp"], {"default": "png"}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
             },
         }
 
-    async def transform(
+    async def describe(
         self,
         image1,
         prompt,
-        model,
-        input_fidelity,
-        quality,
-        size,
-        seed,
         base_url,
         api_key,
         persist_settings,
-        split_prompts,
         unique_id,
-        image2=None,
-        image3=None,
-        image4=None,
-        image5=None,
-        output_format=None,
     ):
         task_count = _max_list_length(
             image1,
             prompt,
-            model,
-            input_fidelity,
-            quality,
-            size,
-            seed,
             base_url,
             api_key,
             persist_settings,
-            split_prompts,
-            image2 or [],
-            image3 or [],
-            image4 or [],
-            image5 or [],
-            output_format or [],
         )
 
         callables = []
-        optional_images = [image2 or [], image3 or [], image4 or [], image5 or []]
         for index in range(task_count):
             prompt_value = _clean_string(_pick_list_value(prompt, index))
             if not prompt_value:
                 raise ValueError("Prompt cannot be empty.")
 
-            prompts = _expand_prompt_tasks(prompt_value, bool(_pick_list_value(split_prompts, index)))
             selected_images = [_pick_list_value(image1, index)]
-            selected_images.extend(_pick_list_value(images, index) for images in optional_images)
             image_jobs = _flatten_image_batches(selected_images)
             if not image_jobs:
                 raise ValueError("At least one image input is required.")
 
-            for single_prompt in prompts:
-                for image_b64_list in image_jobs:
-                    callables.append(functools.partial(
-                        call_images_edit,
-                        prompt=single_prompt,
-                        image_b64_list=image_b64_list,
-                        model=_pick_list_value(model, index),
-                        input_fidelity=_pick_list_value(input_fidelity, index),
-                        quality=_pick_list_value(quality, index),
-                        size=resolve_size(_pick_list_value(size, index)),
-                        output_format=_pick_list_value(output_format or ["png"], index),
-                        seed=int(_pick_list_value(seed, index)),
-                        base_url=_pick_list_value(base_url, index),
-                        api_key=_pick_list_value(api_key, index),
-                        persist_settings=bool(_pick_list_value(persist_settings, index)),
-                    ))
+            for image_b64_list in image_jobs:
+                if len(image_b64_list) != 1:
+                    raise ValueError("Image-to-text accepts exactly one image per task.")
+                callables.append(functools.partial(
+                    call_image_to_text,
+                    prompt=prompt_value,
+                    image_b64=image_b64_list[0],
+                    base_url=_pick_list_value(base_url, index),
+                    api_key=_pick_list_value(api_key, index),
+                    persist_settings=bool(_pick_list_value(persist_settings, index)),
+                ))
 
-        image_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
-        return _build_result_payload(image_groups, status_lines, "gptimage2_img2img")
+        text_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
+        texts = [group["text"] for group in text_groups if group.get("text")]
+        text = "\n\n".join(texts)
+        status_text = _format_status_text(status_lines)
+        return {
+            "ui": {"text": (text, status_text)},
+            "result": (text, status_text),
+        }
 
 
 NODE_CLASS_MAPPINGS = {
     "GPTImage2_Text2Img": GPTImage2Text2Img,
-    "GPTImage2_Img2Img": GPTImage2Img2Img,
+    "GPTImage2_Img2Text": GPTImage2Img2Text,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2_Text2Img": "GPT_Image 文生图",
-    "GPTImage2_Img2Img": "GPT_Image 图生图",
+    "GPTImage2_Img2Text": "GPT_Image 图生文",
 }

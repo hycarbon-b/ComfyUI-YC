@@ -34,7 +34,7 @@ class AspectRatioPrompt:
         [Any text node] → [AspectRatioPrompt] → [GPT_T2文生图 prompt]
     """
 
-    CATEGORY = "🔵BB GPTIMAGE2"
+    CATEGORY = "API/GPTImage2"
     RETURN_TYPES = ("STRING",)
     FUNCTION = "enhance"
     OUTPUT_NODE = True

@@ -322,7 +322,7 @@ def call_images_generate_with_refs(prompt: str, image_b64_list: list[str],
 class GPTImage2Text2Img:
     """Generate images from a text prompt using gpt-image-2."""
 
-    CATEGORY = "🔵BB GPTIMAGE2"
+    CATEGORY = "API/GPTImage2"
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "generate"
     OUTPUT_NODE = True
@@ -395,7 +395,7 @@ class GPTImage2Text2Img:
 class GPTImage2Img2Img:
     """Transform an input image using gpt-image-2 with text guidance."""
 
-    CATEGORY = "🔵BB GPTIMAGE2"
+    CATEGORY = "API/GPTImage2"
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "transform"
     OUTPUT_NODE = True
@@ -498,7 +498,7 @@ class GPTImage2Img2Img:
 class GPTImageNode:
     """GPT-Image node compatible with the GPTImageNode class_type workflow."""
 
-    CATEGORY = "🔵BB GPTIMAGE2"
+    CATEGORY = "API/GPTImage2"
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "generate"
     OUTPUT_NODE = True

@@ -383,9 +383,10 @@ def call_images_generate(
     return {"images": images, "status_lines": status_lines}
 
 
-def call_image_to_text(
+def call_images_edit(
     prompt: str,
     image_b64: str,
+    model: str,
     base_url: str,
     api_key: str,
     persist_settings: bool,
@@ -393,29 +394,42 @@ def call_image_to_text(
 ) -> dict:
     resolved_base_url, resolved_api_key = build_request_settings(base_url, api_key, persist_settings)
     if not image_b64:
-        raise ValueError("An input image is required for image-to-text.")
+        raise ValueError("An input image is required for image-to-image edit.")
+    if not prompt:
+        raise ValueError("A prompt (edit instruction) is required.")
 
-    response, status_lines = _request_with_status(
-        "POST",
-        f"{resolved_base_url}/chat/completions",
-        headers=build_headers(resolved_api_key),
-        json_payload={
-            "model": DEFAULT_VISION_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                    ],
-                }
-            ],
-        },
-        timeout=timeout,
-    )
-    text = extract_response_text(response.json())
-    status_lines.append("RECEIVED text response" if text else "RECEIVED empty text response")
-    return {"text": text, "status_lines": status_lines}
+    edit_model = model if model.endswith("-edit") else f"{model}-edit"
+    image_bytes = base64.b64decode(image_b64)
+    
+    files = {
+        "image": ("image.png", image_bytes, "image/png"),
+        "prompt": (None, prompt),
+        "model": (None, edit_model),
+    }
+    headers = {"Authorization": f"Bearer {resolved_api_key}"}
+    
+    status_lines = [f"SENT POST {resolved_base_url}/images/edits"]
+    try:
+        response = requests.post(
+            f"{resolved_base_url}/images/edits",
+            headers=headers,
+            files=files,
+            timeout=timeout,
+            verify=False,
+        )
+    except requests.RequestException as exc:
+        status_lines.append(f"FAILED POST -> {exc.__class__.__name__}: {exc}")
+        raise RequestStatusError(status_lines) from exc
+
+    body_preview = _truncate_text(response.text or "<empty>")
+    status_lines.append(f"HTTP {response.status_code} {response.reason}: {body_preview}")
+    if not response.ok:
+        raise RequestStatusError(status_lines)
+
+    images, download_statuses = extract_response_images(response.json(), timeout=timeout)
+    status_lines.extend(download_statuses)
+    status_lines.append(f"RECEIVED {len(images)} edited image(s)")
+    return {"images": images, "status_lines": status_lines}
 
 
 async def _run_parallel_jobs(callables: list[functools.partial], unique_id: str | None) -> tuple[list[dict], list[str]]:
@@ -508,11 +522,11 @@ class GPTImage2Text2Img:
         return _build_result_payload(image_groups, status_lines, "gptimage2_text2img")
 
 
-class GPTImage2Img2Text:
+class GPTImage2Img2Img:
     CATEGORY = PLUGIN_CATEGORY
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("text", "status")
-    FUNCTION = "describe"
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "status")
+    FUNCTION = "edit"
     OUTPUT_NODE = True
     INPUT_IS_LIST = True
 
@@ -524,8 +538,8 @@ class GPTImage2Img2Text:
                 "image1": ("IMAGE",),
                 "prompt": ("STRING", {
                     "multiline": True,
-                    "default": "Describe this image in detail.",
-                    "placeholder": "Ask what to extract from the image...",
+                    "default": "Apply artistic style and enhance colors",
+                    "placeholder": "Describe how to edit the image...",
                 }),
                 "base_url": ("STRING", {
                     "default": config.get("base_url", DEFAULT_BASE_URL),
@@ -542,7 +556,7 @@ class GPTImage2Img2Text:
             },
         }
 
-    async def describe(
+    async def edit(
         self,
         image1,
         prompt,
@@ -551,6 +565,9 @@ class GPTImage2Img2Text:
         persist_settings,
         unique_id,
     ):
+        config = get_config()
+        edit_model = config.get("edit_model", DEFAULT_GENERATE_MODEL)
+
         task_count = _max_list_length(
             image1,
             prompt,
@@ -563,7 +580,7 @@ class GPTImage2Img2Text:
         for index in range(task_count):
             prompt_value = _clean_string(_pick_list_value(prompt, index))
             if not prompt_value:
-                raise ValueError("Prompt cannot be empty.")
+                raise ValueError("Prompt (edit instruction) cannot be empty.")
 
             selected_images = [_pick_list_value(image1, index)]
             image_jobs = _flatten_image_batches(selected_images)
@@ -572,32 +589,27 @@ class GPTImage2Img2Text:
 
             for image_b64_list in image_jobs:
                 if len(image_b64_list) != 1:
-                    raise ValueError("Image-to-text accepts exactly one image per task.")
+                    raise ValueError("Image-to-image edit accepts exactly one image per task.")
                 callables.append(functools.partial(
-                    call_image_to_text,
+                    call_images_edit,
                     prompt=prompt_value,
                     image_b64=image_b64_list[0],
+                    model=edit_model,
                     base_url=_pick_list_value(base_url, index),
                     api_key=_pick_list_value(api_key, index),
                     persist_settings=bool(_pick_list_value(persist_settings, index)),
                 ))
 
-        text_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
-        texts = [group["text"] for group in text_groups if group.get("text")]
-        text = "\n\n".join(texts)
-        status_text = _format_status_text(status_lines)
-        return {
-            "ui": {"text": (text, status_text)},
-            "result": (text, status_text),
-        }
+        image_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
+        return _build_result_payload(image_groups, status_lines, "gptimage2_img2img")
 
 
 NODE_CLASS_MAPPINGS = {
     "GPTImage2_Text2Img": GPTImage2Text2Img,
-    "GPTImage2_Img2Text": GPTImage2Img2Text,
+    "GPTImage2_Img2Img": GPTImage2Img2Img,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2_Text2Img": "GPT_Image 文生图",
-    "GPTImage2_Img2Text": "GPT_Image 图生文",
+    "GPTImage2_Img2Img": "GPT_Image 图生图",
 }

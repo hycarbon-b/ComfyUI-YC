@@ -1,4 +1,5 @@
 {
   "base_url": "https://gw-stg.tradingbase.ai/v1",
-  "api_key": "sk-doKcKuvmFoM7RAARaNO1Uyda4e6mJUGt0CIW3Y8B4oC5Xtlx"
+  "api_key": "",
+  "edit_model": "gpt-image-2-edit"
 }

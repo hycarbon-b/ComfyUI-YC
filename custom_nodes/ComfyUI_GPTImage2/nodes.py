@@ -1,61 +1,184 @@
-"""
-GPTImage2 API Nodes for ComfyUI.
-
-Supports:
-  - Text-to-Image generation (via /v1/images/generations)
-  - Image-to-Image (via /v1/images/edits)
-"""
+"""GPT image nodes for ComfyUI."""
 
 import asyncio
-import os
-import io
-import json
 import base64
 import functools
-import requests
-import urllib3
+import io
+import json
+import os
+import threading
+import uuid
+
 import numpy as np
 from PIL import Image
+import requests
 import torch
+import urllib3
+
+import comfy.utils
+import folder_paths
+import nodes as comfy_nodes
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-def get_config():
-    config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    base_url = os.environ.get("GPTIMAGE2_BASE_URL", "https://api.bltcy.ai/v1")
-    api_key = os.environ.get("GPTIMAGE2_API_KEY", "")
-    return {"base_url": base_url, "api_key": api_key}
+PLUGIN_CATEGORY = "YC/GPT Image"
+DEFAULT_BASE_URL = "https://gw-stg.tradingbase.ai/v1"
+DEFAULT_EDIT_MODEL = "gpt-image-2-edit"
+LEGACY_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+CONFIG_FILE_NAME = "config.json"
+CONFIG_DIRECTORY_NAME = "gptimage2"
+CONFIG_KEYS = ("base_url", "api_key", "edit_model")
+CONFIG_LOCK = threading.Lock()
 
 
-def get_default_edit_model() -> str:
-    cfg = get_config()
-    return cfg.get("edit_model") or os.environ.get("GPTIMAGE2_EDIT_MODEL", "gpt-image-2-edit")
+class RequestStatusError(ValueError):
+    def __init__(self, status_lines: list[str]):
+        super().__init__("\n".join(status_lines))
+        self.status_lines = status_lines
 
 
-def get_headers():
-    cfg = get_config()
-    api_key = cfg.get("api_key", os.environ.get("GPTIMAGE2_API_KEY", ""))
+def _clean_string(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_base_url(value: str) -> str:
+    cleaned = _clean_string(value)
+    return cleaned.rstrip("/") if cleaned else ""
+
+
+def _truncate_text(value: str, limit: int = 240) -> str:
+    text = _clean_string(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _read_json_file(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as file:
+        data = json.load(file)
+    return data if isinstance(data, dict) else {}
+
+
+def _write_json_file(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+
+
+def get_config_path() -> str:
+    config_dir = folder_paths.get_system_user_directory(CONFIG_DIRECTORY_NAME)
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, CONFIG_FILE_NAME)
+
+
+def _default_config() -> dict:
     return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "base_url": _normalize_base_url(os.environ.get("GPTIMAGE2_BASE_URL")) or DEFAULT_BASE_URL,
+        "api_key": _clean_string(os.environ.get("GPTIMAGE2_API_KEY")),
+        "edit_model": _clean_string(os.environ.get("GPTIMAGE2_EDIT_MODEL")) or DEFAULT_EDIT_MODEL,
     }
 
 
+def _merge_config(stored: dict) -> dict:
+    config = _default_config()
+    for key in CONFIG_KEYS:
+        if key not in stored:
+            continue
+        if key == "base_url":
+            value = _normalize_base_url(stored.get(key))
+            if value:
+                config[key] = value
+            continue
+        value = _clean_string(stored.get(key))
+        if value or key == "api_key":
+            config[key] = value
+    return config
+
+
+def _ensure_config_migrated() -> str:
+    config_path = get_config_path()
+    if os.path.exists(config_path):
+        return config_path
+    legacy_config = _read_json_file(LEGACY_CONFIG_PATH)
+    if legacy_config:
+        _write_json_file(config_path, _merge_config(legacy_config))
+    return config_path
+
+
+def get_config() -> dict:
+    return _merge_config(_read_json_file(_ensure_config_migrated()))
+
+
+def save_config(updates: dict) -> dict:
+    config_path = _ensure_config_migrated()
+    with CONFIG_LOCK:
+        stored = _read_json_file(config_path)
+        merged = _merge_config(stored)
+        for key in CONFIG_KEYS:
+            if key not in updates:
+                continue
+            if key == "base_url":
+                value = _normalize_base_url(updates[key])
+                if value:
+                    merged[key] = value
+                continue
+            value = _clean_string(updates[key])
+            if value or key == "api_key":
+                merged[key] = value
+        _write_json_file(config_path, merged)
+    return merged
+
+
+def get_default_edit_model() -> str:
+    return get_config().get("edit_model") or DEFAULT_EDIT_MODEL
+
+
+def build_request_settings(base_url: str = "", api_key: str = "", persist_settings: bool = False) -> tuple[str, str]:
+    config = get_config()
+    resolved_base_url = _normalize_base_url(base_url) or config.get("base_url", DEFAULT_BASE_URL)
+
+    provided_api_key = _clean_string(api_key)
+    if provided_api_key == "OPENAI_API_KEY":
+        provided_api_key = ""
+    resolved_api_key = provided_api_key or config.get("api_key", "")
+
+    if persist_settings:
+        updates = {}
+        if _normalize_base_url(base_url) and resolved_base_url != config.get("base_url", DEFAULT_BASE_URL):
+            updates["base_url"] = resolved_base_url
+        if provided_api_key and provided_api_key != config.get("api_key", ""):
+            updates["api_key"] = provided_api_key
+        if updates:
+            save_config(updates)
+
+    return resolved_base_url, resolved_api_key
+
+
+def build_headers(api_key: str, with_content_type: bool = True) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+    if with_content_type:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
 _http_session = None
+
 
 def get_http_session():
     global _http_session
     if _http_session is None:
         _http_session = requests.Session()
+        _http_session.trust_env = False
         _http_session.verify = False
         adapter = requests.adapters.HTTPAdapter(
             max_retries=requests.packages.urllib3.util.retry.Retry(
@@ -67,74 +190,34 @@ def get_http_session():
     return _http_session
 
 
-# ---------------------------------------------------------------------------
-# Aspect Ratio → Pixel Dimensions
-# ---------------------------------------------------------------------------
-
 ASPECT_RATIOS = {
-    "1:1":    (1024, 1024),
-    "4:3":    (1024, 768),
-    "3:2":    (1024, 682),
-    "16:9":   (1280, 720),
-    "21:9":   (1680, 720),
-    "2:3":    (768, 1152),
-    "3:4":    (768, 1024),
-    "9:16":   (768, 1365),
-    "9:21":   (720, 1680),
+    "1:1": (1024, 1024),
+    "4:3": (1024, 768),
+    "3:2": (1024, 682),
+    "16:9": (1280, 720),
+    "21:9": (1680, 720),
+    "2:3": (768, 1152),
+    "3:4": (768, 1024),
+    "9:16": (768, 1365),
+    "9:21": (720, 1680),
 }
 
 
 def resolve_size(size: str) -> str:
-    """Convert aspect ratio string to pixel dimensions for API, or pass through 'auto'."""
     if size in ASPECT_RATIOS:
-        w, h = ASPECT_RATIOS[size]
-        return f"{w}x{h}"
-    return size  # "auto" or other
+        width, height = ASPECT_RATIOS[size]
+        return f"{width}x{height}"
+    return size
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    return buf.getvalue()
+    buffer = io.BytesIO()
+    img.save(buffer, format=fmt)
+    return buffer.getvalue()
 
 
 def image_to_base64(img: Image.Image) -> str:
     return base64.b64encode(pil_to_bytes(img)).decode("utf-8")
-
-
-def image_b64_to_data_url(image_b64: str, mime: str = "image/png") -> str:
-    return f"data:{mime};base64,{image_b64}"
-
-
-def make_empty_mask_b64_from_image_b64(image_b64: str) -> str:
-    img_bytes = base64.b64decode(image_b64)
-    with Image.open(io.BytesIO(img_bytes)) as img:
-        rgba = img.convert("RGBA")
-        empty_mask = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
-    return image_to_base64(empty_mask)
-
-
-def parse_error_message(resp: requests.Response) -> str:
-    try:
-        payload = resp.json()
-    except ValueError:
-        return resp.text[:500]
-
-    error = payload.get("error")
-    if isinstance(error, dict):
-        return error.get("message") or json.dumps(error, ensure_ascii=False)
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def should_send_input_fidelity(model: str, input_fidelity: str | None) -> bool:
-    if not input_fidelity:
-        return False
-    normalized = (model or "").strip().lower()
-    return not normalized.startswith("gpt-image-2")
 
 
 def np_to_pil(arr: np.ndarray) -> Image.Image:
@@ -149,186 +232,259 @@ def np_to_pil(arr: np.ndarray) -> Image.Image:
     return Image.fromarray(arr, mode="RGB")
 
 
-# ---------------------------------------------------------------------------
-# API Calls
+def _pick_list_value(values, index: int):
+    if not isinstance(values, list):
+        return values
+    if not values:
+        return None
+    return values[index if index < len(values) else -1]
 
-# ---------------------------------------------------------------------------
-# API Calls
-# ---------------------------------------------------------------------------
 
-def call_images_generate(prompt: str, model: str = "gpt-image-2",
-                          n: int = 1, quality: str = "medium",
-                          size: str = "1024x1024", output_format: str = "png",
-                          seed: int = -1, timeout: int | None = None) -> list[str]:
-    """Call POST /v1/images/generations and return list of base64 image strings."""
-    cfg = get_config()
-    base_url = cfg.get("base_url", os.environ.get(
-        "GPTIMAGE2_BASE_URL", "https://api.bltcy.ai/v1")).rstrip("/")
+def _max_list_length(*values) -> int:
+    lengths = [len(value) for value in values if isinstance(value, list)]
+    return max(lengths, default=1)
 
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "n": n,
-        "quality": quality,
-        "size": size,
-        "output_format": output_format,
-        "seed": seed,
-    }
 
-    resp = get_http_session().post(
-        f"{base_url}/images/generations",
-        headers=get_headers(),
-        json=payload,
-        timeout=timeout,
-    )
-    print(f"[GPTImage2] Status: {resp.status_code}, Body: {resp.text[:500]}")
-    resp.raise_for_status()
-    data = resp.json()
+def _expand_prompt_tasks(prompt_value: str, split_prompts: bool) -> list[str]:
+    if not split_prompts:
+        return [prompt_value]
+    prompts = [line.strip() for line in prompt_value.splitlines() if line.strip()]
+    return prompts or [prompt_value]
 
+
+def _b64_to_tensor(image_b64: str) -> torch.Tensor:
+    img_bytes = base64.b64decode(image_b64)
+    image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    arr = np.array(image).astype(np.float32) / 255.0
+    return torch.from_numpy(arr)[None]
+
+
+def _flatten_image_batches(image_inputs: list[torch.Tensor | None]) -> list[list[str]]:
+    max_batch = 1
+    normalized_inputs = []
+    for image in image_inputs:
+        if image is None:
+            normalized_inputs.append(None)
+            continue
+        normalized_inputs.append(image)
+        if image.ndim == 4:
+            max_batch = max(max_batch, image.shape[0])
+
+    jobs = []
+    for batch_index in range(max_batch):
+        job_images = []
+        for image in normalized_inputs:
+            if image is None:
+                continue
+            if image.ndim == 4:
+                if image.shape[0] not in (1, max_batch):
+                    raise ValueError("Batched image inputs must all share the same batch size, or be a single image.")
+                image_tensor = image[batch_index if image.shape[0] > 1 else 0]
+            else:
+                image_tensor = image
+            if image_tensor.shape[-1] in (1, 3, 4):
+                image_tensor = image_tensor[..., :3]
+            job_images.append(image_to_base64(np_to_pil(image_tensor.cpu().numpy())))
+        if job_images:
+            jobs.append(job_images)
+    return jobs
+
+
+def _request_with_status(method: str, url: str, *, headers: dict, json_payload=None, files=None, timeout: int | None = None) -> tuple[requests.Response, list[str]]:
+    status_lines = [f"SENT {method} {url}"]
+    try:
+        response = get_http_session().request(
+            method=method,
+            url=url,
+            headers=headers,
+            json=json_payload,
+            files=files,
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        status_lines.append(f"FAILED {method} {url} -> {exc.__class__.__name__}: {exc}")
+        raise RequestStatusError(status_lines) from exc
+
+    body_preview = _truncate_text(response.text or "<empty>")
+    status_lines.append(f"HTTP {response.status_code} {response.reason}: {body_preview}")
+    if not response.ok:
+        raise RequestStatusError(status_lines)
+    return response, status_lines
+
+
+def _download_image_as_b64(url: str, timeout: int | None = None) -> tuple[str, list[str]]:
+    response, status_lines = _request_with_status("GET", url, headers={}, timeout=timeout)
+    return base64.b64encode(response.content).decode("utf-8"), status_lines
+
+
+def extract_response_images(data: dict, timeout: int | None = None) -> tuple[list[str], list[str]]:
     images = []
+    download_statuses = []
     for item in data.get("data", []):
         if "b64_json" in item:
             images.append(item["b64_json"])
         elif "url" in item:
-            img_resp = get_http_session().get(item["url"], timeout=timeout)
-            img_resp.raise_for_status()
-            images.append(base64.b64encode(img_resp.content).decode("utf-8"))
-    return images
+            image_b64, status_lines = _download_image_as_b64(item["url"], timeout=timeout)
+            images.append(image_b64)
+            download_statuses.extend(status_lines)
+    return images, download_statuses
 
 
-def call_images_edit(prompt: str, image_b64_list: list[str],
-                     mask_b64: str | None = None,
-                     model: str = "gpt-image-2-edit",
-                     n: int = 1, quality: str = "medium",
-                     input_fidelity: str = "high",
-                     size: str = "1024x1024", output_format: str = "png",
-                     seed: int = -1, timeout: int | None = None) -> list[str]:
-    """Call POST /v1/images/edits and return list of base64 image strings."""
-    cfg = get_config()
-    base_url = cfg.get("base_url", os.environ.get(
-        "GPTIMAGE2_BASE_URL", "https://api.bltcy.ai/v1")).rstrip("/")
+def _save_preview_images(images: torch.Tensor, prefix: str) -> list[dict]:
+    preview_node = comfy_nodes.PreviewImage()
+    preview_node.prefix_append = f"_{prefix}_{uuid.uuid4().hex[:8]}"
+    ui_payload = preview_node.save_images(images)
+    return ui_payload.get("ui", {}).get("images", [])
 
+
+def _format_status_text(status_lines: list[str]) -> str:
+    return "\n".join(status_lines)
+
+
+def _build_result_payload(image_groups: list[dict], status_lines: list[str], preview_prefix: str) -> dict:
+    tensors = []
+    for group in image_groups:
+        for image_b64 in group["images"]:
+            tensors.append(_b64_to_tensor(image_b64))
+    if not tensors:
+        raise ValueError("No images were returned from the API.")
+
+    image_tensor = torch.cat(tensors, dim=0)
+    status_text = _format_status_text(status_lines)
+    return {
+        "ui": {
+            "images": _save_preview_images(image_tensor, preview_prefix),
+            "text": (status_text,),
+        },
+        "result": (image_tensor, status_text),
+    }
+
+
+def call_images_generate(
+    prompt: str,
+    model: str,
+    quality: str,
+    size: str,
+    output_format: str,
+    seed: int,
+    base_url: str,
+    api_key: str,
+    persist_settings: bool,
+    timeout: int | None = None,
+) -> dict:
+    resolved_base_url, resolved_api_key = build_request_settings(base_url, api_key, persist_settings)
+    response, status_lines = _request_with_status(
+        "POST",
+        f"{resolved_base_url}/images/generations",
+        headers=build_headers(resolved_api_key),
+        json_payload={
+            "model": model,
+            "prompt": prompt,
+            "quality": quality,
+            "size": size,
+            "output_format": output_format,
+            "seed": seed,
+        },
+        timeout=timeout,
+    )
+    images, download_statuses = extract_response_images(response.json(), timeout=timeout)
+    status_lines.extend(download_statuses)
+    status_lines.append(f"RECEIVED {len(images)} image(s)")
+    return {"images": images, "status_lines": status_lines}
+
+
+def call_images_edit(
+    prompt: str,
+    image_b64_list: list[str],
+    model: str,
+    input_fidelity: str,
+    quality: str,
+    size: str,
+    output_format: str,
+    seed: int,
+    base_url: str,
+    api_key: str,
+    persist_settings: bool,
+    timeout: int | None = None,
+) -> dict:
+    resolved_base_url, resolved_api_key = build_request_settings(base_url, api_key, persist_settings)
     if not image_b64_list:
         raise ValueError("At least one input image is required for image edits.")
 
-    model = (model or "").strip() or get_default_edit_model()
-
+    resolved_model = _clean_string(model) or get_default_edit_model()
     files = [
         ("prompt", (None, prompt)),
-        ("model", (None, model)),
-        ("n", (None, str(n))),
+        ("model", (None, resolved_model)),
         ("quality", (None, quality)),
         ("size", (None, size)),
         ("output_format", (None, output_format)),
         ("seed", (None, str(seed))),
     ]
-
-    if should_send_input_fidelity(model, input_fidelity):
+    if input_fidelity and not resolved_model.lower().startswith("gpt-image-2"):
         files.append(("input_fidelity", (None, input_fidelity)))
-
     for index, image_b64 in enumerate(image_b64_list, start=1):
-        files.append((
-            "image",
-            (f"image{index}.png", base64.b64decode(image_b64), "image/png"),
-        ))
+        files.append(("image", (f"image{index}.png", base64.b64decode(image_b64), "image/png")))
 
-    if mask_b64:
-        files.append(("mask", ("mask.png", base64.b64decode(mask_b64), "image/png")))
-
-    headers = {
-        "Authorization": get_headers()["Authorization"],
-    }
-
-    resp = get_http_session().post(
-        f"{base_url}/images/edits",
-        headers=headers,
+    response, status_lines = _request_with_status(
+        "POST",
+        f"{resolved_base_url}/images/edits",
+        headers=build_headers(resolved_api_key, with_content_type=False),
         files=files,
         timeout=timeout,
     )
-    print(f"[GPTImage2] Status: {resp.status_code}, Body: {resp.text[:500]}")
-    resp.raise_for_status()
-    data = resp.json()
-
-    images = []
-    for item in data.get("data", []):
-        if "b64_json" in item:
-            images.append(item["b64_json"])
-        elif "url" in item:
-            img_resp = get_http_session().get(item["url"], timeout=timeout)
-            img_resp.raise_for_status()
-            images.append(base64.b64encode(img_resp.content).decode("utf-8"))
-    return images
+    images, download_statuses = extract_response_images(response.json(), timeout=timeout)
+    status_lines.extend(download_statuses)
+    status_lines.append(f"RECEIVED {len(images)} image(s)")
+    return {"images": images, "status_lines": status_lines}
 
 
-def call_images_generate_with_refs(prompt: str, image_b64_list: list[str],
-                                   mask_b64: str | None = None,
-                                   model: str = "gpt-image-2",
-                                   n: int = 1, quality: str = "medium",
-                                   size: str = "1024x1024", output_format: str = "png",
-                                   seed: int = -1, timeout: int | None = None) -> list[str]:
-    """Gateway fallback: call POST /v1/images/generations with image references in JSON."""
-    cfg = get_config()
-    base_url = cfg.get("base_url", os.environ.get(
-        "GPTIMAGE2_BASE_URL", "https://api.bltcy.ai/v1")).rstrip("/")
+async def _run_parallel_jobs(callables: list[functools.partial], unique_id: str | None) -> tuple[list[dict], list[str]]:
+    loop = asyncio.get_running_loop()
+    progress = comfy.utils.ProgressBar(len(callables), node_id=unique_id)
 
-    if not image_b64_list:
-        raise ValueError("At least one input image is required for image generation with references.")
+    async def run_one(index: int, func: functools.partial):
+        result = await loop.run_in_executor(None, func)
+        return index, result
 
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "n": n,
-        "quality": quality,
-        "size": size,
-        "output_format": output_format,
-        "seed": seed,
-    }
+    tasks = [asyncio.create_task(run_one(index, func)) for index, func in enumerate(callables)]
+    results = [None] * len(callables)
+    errors = []
+    completed = 0
 
-    data_urls = [image_b64_to_data_url(b64) for b64 in image_b64_list]
-    if len(data_urls) == 1:
-        payload["image"] = data_urls[0]
-    else:
-        payload["images"] = data_urls
+    for task in asyncio.as_completed(tasks):
+        try:
+            index, result = await task
+            results[index] = result
+        except RequestStatusError as exc:
+            errors.extend(exc.status_lines)
+        except Exception as exc:
+            errors.append(str(exc))
+        completed += 1
+        progress.update_absolute(completed, len(callables))
 
-    # For this gateway family, an explicit transparent mask improves compatibility.
-    effective_mask_b64 = mask_b64 or make_empty_mask_b64_from_image_b64(image_b64_list[0])
-    payload["mask"] = image_b64_to_data_url(effective_mask_b64)
+    if errors:
+        raise ValueError("\n".join(errors))
 
-    resp = get_http_session().post(
-        f"{base_url}/images/generations",
-        headers=get_headers(),
-        json=payload,
-        timeout=timeout,
-    )
-    print(f"[GPTImage2-fallback] Status: {resp.status_code}, Body: {resp.text[:500]}")
-    resp.raise_for_status()
-    data = resp.json()
+    status_lines = []
+    ordered_results = []
+    for index, result in enumerate(results, start=1):
+        ordered_results.append(result)
+        status_lines.append(f"TASK {index}")
+        status_lines.extend(result["status_lines"])
+    return ordered_results, status_lines
 
-    images = []
-    for item in data.get("data", []):
-        if "b64_json" in item:
-            images.append(item["b64_json"])
-        elif "url" in item:
-            img_resp = get_http_session().get(item["url"], timeout=timeout)
-            img_resp.raise_for_status()
-            images.append(base64.b64encode(img_resp.content).decode("utf-8"))
-    return images
-
-
-# ---------------------------------------------------------------------------
-# ComfyUI Node — Text to Image
-# ---------------------------------------------------------------------------
 
 class GPTImage2Text2Img:
-    """Generate images from a text prompt using gpt-image-2."""
-
-    CATEGORY = "API/GPTImage2"
-    RETURN_TYPES = ("IMAGE",)
+    CATEGORY = PLUGIN_CATEGORY
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "status")
     FUNCTION = "generate"
     OUTPUT_NODE = True
+    INPUT_IS_LIST = True
 
     @classmethod
     def INPUT_TYPES(cls):
+        config = get_config()
         return {
             "required": {
                 "prompt": ("STRING", {
@@ -336,72 +492,67 @@ class GPTImage2Text2Img:
                     "default": "A beautiful landscape at sunset",
                     "placeholder": "Enter your prompt here...",
                 }),
-                "model": (["gpt-image-2", "gpt-image-1.5", "gpt-image-1"], {
-                    "default": "gpt-image-2",
+                "model": (["gpt-image-2", "gpt-image-1.5", "gpt-image-1"], {"default": "gpt-image-2"}),
+                "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
+                "size": (["1:1", "4:3", "3:2", "16:9", "21:9", "2:3", "3:4", "9:16", "9:21", "auto"], {"default": "auto"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647, "step": 1}),
+                "base_url": ("STRING", {
+                    "default": config.get("base_url", DEFAULT_BASE_URL),
+                    "placeholder": "OpenAI-compatible base URL",
                 }),
-                "quality": (["low", "medium", "high", "auto"], {
-                    "default": "medium",
+                "api_key": ("STRING", {
+                    "default": "",
+                    "placeholder": "Leave empty to use saved API key",
                 }),
-                "size": (["1:1", "4:3", "3:2", "16:9", "21:9", "2:3", "3:4", "9:16", "9:21", "auto"], {
-                    "default": "auto",
-                }),
-                "n": ("INT", {
-                    "default": 1, "min": 1, "max": 10, "step": 1,
-                }),
-                "seed": ("INT", {
-                    "default": -1, "min": -1, "max": 2147483647, "step": 1,
-                }),
+                "persist_settings": ("BOOLEAN", {"default": True}),
+                "split_prompts": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "output_format": (["png", "jpeg", "webp"], {
-                    "default": "png",
-                }),
-            }
+                "output_format": (["png", "jpeg", "webp"], {"default": "png"}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
-    async def generate(self, prompt, model, quality, size, n, seed, output_format="png"):
-        loop = asyncio.get_event_loop()
-        images = await loop.run_in_executor(
-            None,
-            functools.partial(
-                call_images_generate,
-                prompt=prompt,
-                model=model,
-                n=n,
-                quality=quality,
-                size=resolve_size(size),
-                seed=seed,
-                output_format=output_format,
-            ),
-        )
+    async def generate(self, prompt, model, quality, size, seed, base_url, api_key, persist_settings, split_prompts, unique_id, output_format=None):
+        task_count = _max_list_length(prompt, model, quality, size, seed, base_url, api_key, persist_settings, split_prompts, output_format or [])
+        callables = []
 
-        tensors = []
-        for b64 in images:
-            img_bytes = base64.b64decode(b64)
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            arr = np.array(img).astype(np.float32) / 255.0
-            tensor = torch.from_numpy(arr)[None]
-            tensors.append(tensor)
+        for index in range(task_count):
+            prompt_value = _clean_string(_pick_list_value(prompt, index))
+            if not prompt_value:
+                raise ValueError("Prompt cannot be empty.")
+            prompts = _expand_prompt_tasks(prompt_value, bool(_pick_list_value(split_prompts, index)))
+            for single_prompt in prompts:
+                callables.append(functools.partial(
+                    call_images_generate,
+                    prompt=single_prompt,
+                    model=_pick_list_value(model, index),
+                    quality=_pick_list_value(quality, index),
+                    size=resolve_size(_pick_list_value(size, index)),
+                    output_format=_pick_list_value(output_format or ["png"], index),
+                    seed=int(_pick_list_value(seed, index)),
+                    base_url=_pick_list_value(base_url, index),
+                    api_key=_pick_list_value(api_key, index),
+                    persist_settings=bool(_pick_list_value(persist_settings, index)),
+                ))
 
-        if not tensors:
-            raise ValueError("No images were returned from the API.")
-        return (torch.cat(tensors, dim=0),)
+        image_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
+        return _build_result_payload(image_groups, status_lines, "gptimage2_text2img")
 
-
-# ---------------------------------------------------------------------------
-# ComfyUI Node — Image to Image
-# ---------------------------------------------------------------------------
 
 class GPTImage2Img2Img:
-    """Transform an input image using gpt-image-2 with text guidance."""
-
-    CATEGORY = "API/GPTImage2"
-    RETURN_TYPES = ("IMAGE",)
+    CATEGORY = PLUGIN_CATEGORY
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "status")
     FUNCTION = "transform"
     OUTPUT_NODE = True
+    INPUT_IS_LIST = True
 
     @classmethod
     def INPUT_TYPES(cls):
+        config = get_config()
         return {
             "required": {
                 "image1": ("IMAGE",),
@@ -411,206 +562,116 @@ class GPTImage2Img2Img:
                     "placeholder": "Describe how to transform the image...",
                 }),
                 "model": ("STRING", {
-                    "default": "gpt-image-2-edit",
+                    "default": get_default_edit_model(),
                     "placeholder": "Edit model name, e.g. gpt-image-2-edit",
                 }),
-                "input_fidelity": (["low", "high"], {
-                    "default": "high",
+                "input_fidelity": (["low", "high"], {"default": "high"}),
+                "quality": (["low", "medium", "high", "auto"], {"default": "medium"}),
+                "size": (["1:1", "4:3", "3:2", "16:9", "21:9", "2:3", "3:4", "9:16", "9:21", "auto"], {"default": "auto"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647, "step": 1}),
+                "base_url": ("STRING", {
+                    "default": config.get("base_url", DEFAULT_BASE_URL),
+                    "placeholder": "OpenAI-compatible base URL",
                 }),
-                "quality": (["low", "medium", "high", "auto"], {
-                    "default": "medium",
+                "api_key": ("STRING", {
+                    "default": "",
+                    "placeholder": "Leave empty to use saved API key",
                 }),
-                "size": (["1:1", "4:3", "3:2", "16:9", "21:9", "2:3", "3:4", "9:16", "9:21", "auto"], {
-                    "default": "auto",
-                }),
-                "n": ("INT", {
-                    "default": 1, "min": 1, "max": 10, "step": 1,
-                }),
-                "seed": ("INT", {
-                    "default": -1, "min": -1, "max": 2147483647, "step": 1,
-                }),
+                "persist_settings": ("BOOLEAN", {"default": True}),
+                "split_prompts": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "image2": ("IMAGE",),
                 "image3": ("IMAGE",),
                 "image4": ("IMAGE",),
                 "image5": ("IMAGE",),
-                "output_format": (["png", "jpeg", "webp"], {
-                    "default": "png",
-                }),
-            }
-        }
-
-    async def transform(self, image1, prompt, model, input_fidelity,
-                        quality, size, n, seed, output_format="png",
-                        image2=None, image3=None, image4=None, image5=None):
-        all_images = [image1, image2, image3, image4, image5]
-        valid_images = []
-        for img in all_images:
-            if img is not None:
-                img_tensor = img[0] if img.ndim == 4 else img
-                if img_tensor.shape[-1] in (1, 3, 4):
-                    img_tensor = img_tensor[..., :3]
-                pil_img = np_to_pil(img_tensor.cpu().numpy())
-                valid_images.append(pil_img)
-
-        if not valid_images:
-            raise ValueError("At least one image input is required.")
-        if not prompt or not prompt.strip():
-            raise ValueError("Prompt cannot be empty.")
-
-        image_b64_list = [image_to_base64(img) for img in valid_images]
-
-        loop = asyncio.get_event_loop()
-        images = await loop.run_in_executor(
-            None,
-            functools.partial(
-                call_images_edit,
-                prompt=prompt,
-                image_b64_list=image_b64_list,
-                model=model,
-                n=n,
-                input_fidelity=input_fidelity,
-                quality=quality,
-                size=resolve_size(size),
-                seed=seed,
-                output_format=output_format,
-            ),
-        )
-
-        tensors = []
-        for b64 in images:
-            img_bytes = base64.b64decode(b64)
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            arr = np.array(img).astype(np.float32) / 255.0
-            tensor = torch.from_numpy(arr)[None]
-            tensors.append(tensor)
-
-        if not tensors:
-            raise ValueError("No images were returned from the API.")
-        return (torch.cat(tensors, dim=0),)
-
-
-# ---------------------------------------------------------------------------
-# GPTImageNode — compatible with test_gpt_image_plugin.json workflow
-# ---------------------------------------------------------------------------
-
-class GPTImageNode:
-    """GPT-Image node compatible with the GPTImageNode class_type workflow."""
-
-    CATEGORY = "API/GPTImage2"
-    RETURN_TYPES = ("IMAGE",)
-    FUNCTION = "generate"
-    OUTPUT_NODE = True
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {
-                    "multiline": True,
-                    "default": "A beautiful landscape",
-                }),
-                "model": (["gpt-image-2", "gpt-image-1.5", "gpt-image-1"], {
-                    "default": "gpt-image-2",
-                }),
-                "api_key": ("STRING", {
-                    "default": "",
-                    "placeholder": "Leave empty to use config.json",
-                }),
-                "quality": (["low", "medium", "high", "auto"], {
-                    "default": "high",
-                }),
-                "size": (["1024x1024", "1536x1024", "1024x1536", "auto"], {
-                    "default": "1024x1024",
-                }),
-                "background": (["auto", "opaque", "transparent"], {
-                    "default": "auto",
-                }),
-                "output_format": (["png", "jpeg", "webp"], {
-                    "default": "png",
-                }),
-                "output_compression": ("INT", {
-                    "default": 100, "min": 0, "max": 100, "step": 1,
-                }),
-                "n_images": ("INT", {
-                    "default": 1, "min": 1, "max": 10, "step": 1,
-                }),
+                "output_format": (["png", "jpeg", "webp"], {"default": "png"}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
             },
         }
 
-    async def generate(self, prompt, model, api_key, quality, size, background,
-                       output_format, output_compression, n_images):
-        cfg = get_config()
-        base_url = cfg.get("base_url", os.environ.get(
-            "GPTIMAGE2_BASE_URL", "https://api.bltcy.ai/v1")).rstrip("/")
+    async def transform(
+        self,
+        image1,
+        prompt,
+        model,
+        input_fidelity,
+        quality,
+        size,
+        seed,
+        base_url,
+        api_key,
+        persist_settings,
+        split_prompts,
+        unique_id,
+        image2=None,
+        image3=None,
+        image4=None,
+        image5=None,
+        output_format=None,
+    ):
+        task_count = _max_list_length(
+            image1,
+            prompt,
+            model,
+            input_fidelity,
+            quality,
+            size,
+            seed,
+            base_url,
+            api_key,
+            persist_settings,
+            split_prompts,
+            image2 or [],
+            image3 or [],
+            image4 or [],
+            image5 or [],
+            output_format or [],
+        )
 
-        # Use provided api_key if given, else fall back to config
-        key = api_key.strip() if api_key and api_key.strip() and api_key.strip() != "OPENAI_API_KEY" else cfg.get("api_key", "")
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        }
+        callables = []
+        optional_images = [image2 or [], image3 or [], image4 or [], image5 or []]
+        for index in range(task_count):
+            prompt_value = _clean_string(_pick_list_value(prompt, index))
+            if not prompt_value:
+                raise ValueError("Prompt cannot be empty.")
 
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "n": n_images,
-            "quality": quality,
-            "size": size,
-            "output_format": output_format,
-        }
-        if background != "auto":
-            payload["background"] = background
+            prompts = _expand_prompt_tasks(prompt_value, bool(_pick_list_value(split_prompts, index)))
+            selected_images = [_pick_list_value(image1, index)]
+            selected_images.extend(_pick_list_value(images, index) for images in optional_images)
+            image_jobs = _flatten_image_batches(selected_images)
+            if not image_jobs:
+                raise ValueError("At least one image input is required.")
 
-        def _do_request():
-            resp = get_http_session().post(
-                f"{base_url}/images/generations",
-                headers=headers,
-                json=payload,
-                timeout=None,
-            )
-            print(f"[GPTImageNode] Status: {resp.status_code}, Body: {resp.text[:500]}")
-            resp.raise_for_status()
-            return resp.json()
+            for single_prompt in prompts:
+                for image_b64_list in image_jobs:
+                    callables.append(functools.partial(
+                        call_images_edit,
+                        prompt=single_prompt,
+                        image_b64_list=image_b64_list,
+                        model=_pick_list_value(model, index),
+                        input_fidelity=_pick_list_value(input_fidelity, index),
+                        quality=_pick_list_value(quality, index),
+                        size=resolve_size(_pick_list_value(size, index)),
+                        output_format=_pick_list_value(output_format or ["png"], index),
+                        seed=int(_pick_list_value(seed, index)),
+                        base_url=_pick_list_value(base_url, index),
+                        api_key=_pick_list_value(api_key, index),
+                        persist_settings=bool(_pick_list_value(persist_settings, index)),
+                    ))
 
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, _do_request)
+        image_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
+        return _build_result_payload(image_groups, status_lines, "gptimage2_img2img")
 
-        tensors = []
-        for item in data.get("data", []):
-            if "b64_json" in item:
-                b64 = item["b64_json"]
-            elif "url" in item:
-                img_resp = await loop.run_in_executor(
-                    None, functools.partial(get_http_session().get, item["url"], timeout=None)
-                )
-                img_resp.raise_for_status()
-                b64 = base64.b64encode(img_resp.content).decode("utf-8")
-            else:
-                continue
-            img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-            arr = np.array(img).astype(np.float32) / 255.0
-            tensors.append(torch.from_numpy(arr)[None])
-
-        if not tensors:
-            raise ValueError("No images returned from the API.")
-        return (torch.cat(tensors, dim=0),)
-
-
-# ---------------------------------------------------------------------------
-# Node Mappings
-# ---------------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
     "GPTImage2_Text2Img": GPTImage2Text2Img,
     "GPTImage2_Img2Img": GPTImage2Img2Img,
-    "GPTImageNode": GPTImageNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GPTImage2_Text2Img": "GPT_Image 文生图",
     "GPTImage2_Img2Img": "GPT_Image 图生图",
-    "GPTImageNode": "GPT_Image",
 }

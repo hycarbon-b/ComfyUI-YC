@@ -6,20 +6,15 @@
 
 Production-oriented ComfyUI nodes for GPT image providers.
 
-This extension focuses on practical gateway compatibility: configurable base URL, independent model routing for generation and editing, and robust edit fallback behavior.
+This extension focuses on practical gateway compatibility: configurable base URL, persistent credential settings, visible HTTP status feedback, and parallel task execution wrapped inside a single ComfyUI node run.
 
 ## Highlights
 
 - Custom `base_url` and `api_key` for OpenAI-compatible providers
-- Separate model names for Image Gen and Image Edit
-- Concurrent multi-image generation support (no serial waiting)
-- `Img2Img` supports multi-reference input (`image1..image5`)
-- Automatic gateway fallback for edit requests when multipart is blocked
-- Aspect-ratio helper node for prompt workflows
-
-## Why Separate Gen/Edit Models?
-
-Some gateways route `/images/generations` and `/images/edits` differently. Using the same model name for both endpoints may cause provider-side forwarding bugs. This plugin lets you set generation and edit model names independently to avoid those issues.
+- Only two nodes: Text2Img and Img2Img
+- Parallel execution for prompt lists, split-line prompts, and image batches inside one node execution
+- Visible request status output such as `SENT`, `HTTP 200`, and `HTTP 403`
+- Output node previews all generated images directly in ComfyUI
 
 ## Installation
 
@@ -42,11 +37,15 @@ Restart ComfyUI after installation.
 
 ## Quick Configuration
 
-Create or edit `config.json`:
+Create or edit the persisted config file at `user/__gptimage2/config.json`.
+
+Legacy `custom_nodes/ComfyUI_GPTImage2/config.json` will be migrated automatically on first load.
+
+Example:
 
 ```json
 {
-  "base_url": "https://api.your-provider.com/v1",
+  "base_url": "https://gw-stg.tradingbase.ai/v1",
   "api_key": "YOUR_API_KEY",
   "edit_model": "gpt-image-2-edit"
 }
@@ -62,9 +61,8 @@ Environment variable overrides:
 
 | Node | Purpose | Model Input | Notes |
 |---|---|---|---|
-| `GPT_Image Text2Img` | Text to image | Per-node `model` | Supports `n` for multi-image generation |
-| `GPT_Image Img2Img` | Image edit / transform | Per-node `model` + config fallback | Supports `image1..image5` references |
-| `GPT_比例提示词` | Prompt aspect helper | N/A | Ratio-aware prompt enhancement |
+| `GPT_Image 文生图` | Text to image | Per-node `model` | Can split prompt lines into parallel tasks and returns an extra status text output |
+| `GPT_Image 图生图` | Image edit / transform | Per-node `model` | Supports `image1..image5`, image batch fan-out, prompt splitting, and parallel requests |
 
 ## Provider Compatibility Requirements
 
@@ -75,16 +73,15 @@ Your provider should expose both endpoints:
 
 Recommended:
 
-- Allow different model names per endpoint (Gen vs Edit)
 - Proper multipart support for edit requests
-
-If multipart edit is blocked by the gateway, plugin fallback logic can route via generation-style JSON references where available.
+- OpenAI-compatible `POST /v1/images/generations`
+- OpenAI-compatible `POST /v1/images/edits`
 
 ## Troubleshooting
 
-- `model_price_error`: configure model pricing/routing on your provider
-- `invalid_image_request`: provider may reject multipart edit payloads
-- Empty output: verify API key, quota, endpoint availability, and model access
+- `HTTP 403`: check API key permissions or provider allowlist
+- `HTTP 4xx/5xx`: the node status output includes the response code and body preview
+- Empty output: verify endpoint availability and model access
 
 When opening an issue, include:
 
@@ -92,14 +89,6 @@ When opening an issue, include:
 - Full traceback
 - Provider/gateway type
 - Whether `/images/edits` accepts multipart
-
-## Roadmap
-
-- Support more provider-specific image endpoints
-- Add Response API support
-- Improve automatic gateway capability detection
-
-PRs are welcome for new providers and endpoint integrations.
 
 ## License
 

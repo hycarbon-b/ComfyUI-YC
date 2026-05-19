@@ -364,17 +364,35 @@ def call_images_generate(
     base_url: str,
     api_key: str,
     persist_settings: bool,
+    n: int = 1,
+    size: str = "auto",
+    quality: str = "auto",
+    background: str = "auto",
+    output_format: str = "png",
+    output_compression: int = 100,
+    moderation: str = "auto",
+    seed: int = 0,
     timeout: int | None = None,
 ) -> dict:
     resolved_base_url, resolved_api_key = build_request_settings(base_url, api_key, persist_settings)
+    json_payload: dict = {
+        "model": model,
+        "prompt": prompt,
+        "n": n,
+        "size": size,
+        "quality": quality,
+        "background": background,
+        "output_format": output_format,
+        "moderation": moderation,
+        "seed": seed,
+    }
+    if output_format in ("jpeg", "webp"):
+        json_payload["output_compression"] = output_compression
     response, status_lines = _request_with_status(
         "POST",
         f"{resolved_base_url}/images/generations",
         headers=build_headers(resolved_api_key),
-        json_payload={
-            "model": model,
-            "prompt": prompt,
-        },
+        json_payload=json_payload,
         timeout=timeout,
     )
     images, download_statuses = extract_response_images(response.json(), timeout=timeout)
@@ -390,6 +408,15 @@ def call_images_edit(
     base_url: str,
     api_key: str,
     persist_settings: bool,
+    n: int = 1,
+    size: str = "auto",
+    quality: str = "auto",
+    background: str = "auto",
+    output_format: str = "png",
+    output_compression: int = 100,
+    moderation: str = "auto",
+    input_fidelity: str | None = None,
+    seed: int = 0,
     timeout: int | None = None,
 ) -> dict:
     resolved_base_url, resolved_api_key = build_request_settings(base_url, api_key, persist_settings)
@@ -400,22 +427,33 @@ def call_images_edit(
 
     edit_model = model if model.endswith("-edit") else f"{model}-edit"
     image_bytes = base64.b64decode(image_b64)
-    
-    files = {
-        "image": ("image.png", image_bytes, "image/png"),
-        "prompt": (None, prompt),
-        "model": (None, edit_model),
-    }
+
+    files: list[tuple] = [
+        ("image", ("image.png", image_bytes, "image/png")),
+        ("prompt", (None, prompt)),
+        ("model", (None, edit_model)),
+        ("n", (None, str(n))),
+        ("size", (None, size)),
+        ("quality", (None, quality)),
+        ("background", (None, background)),
+        ("output_format", (None, output_format)),
+        ("moderation", (None, moderation)),
+        ("seed", (None, str(seed))),
+    ]
+    if output_format in ("jpeg", "webp"):
+        files.append(("output_compression", (None, str(output_compression))))
+    if input_fidelity and input_fidelity != "default":
+        files.append(("input_fidelity", (None, input_fidelity)))
+
     headers = {"Authorization": f"Bearer {resolved_api_key}"}
-    
+
     status_lines = [f"SENT POST {resolved_base_url}/images/edits"]
     try:
-        response = requests.post(
+        response = get_http_session().post(
             f"{resolved_base_url}/images/edits",
             headers=headers,
             files=files,
             timeout=timeout,
-            verify=False,
         )
     except requests.RequestException as exc:
         status_lines.append(f"FAILED POST -> {exc.__class__.__name__}: {exc}")
@@ -486,6 +524,14 @@ class GPTImage2Text2Img:
                     "default": "A beautiful landscape at sunset",
                     "placeholder": "Enter your prompt here...",
                 }),
+                "n": ("INT", {"default": 1, "min": 1, "max": 10}),
+                "size": (["auto", "1024x1024", "1536x1024", "1024x1536", "1792x1024", "1024x1792", "512x512", "256x256"], {"default": "auto"}),
+                "quality": (["auto", "high", "medium", "low", "hd", "standard"], {"default": "auto"}),
+                "background": (["auto", "opaque", "transparent"], {"default": "auto"}),
+                "output_format": (["png", "jpeg", "webp"], {"default": "png"}),
+                "output_compression": ("INT", {"default": 100, "min": 0, "max": 100}),
+                "moderation": (["auto", "low"], {"default": "auto"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "base_url": ("STRING", {
                     "default": config.get("base_url", DEFAULT_BASE_URL),
                     "placeholder": "OpenAI-compatible base URL",
@@ -501,14 +547,15 @@ class GPTImage2Text2Img:
             },
         }
 
-    async def generate(self, prompt, base_url, api_key, persist_settings, unique_id):
-        task_count = _max_list_length(prompt, base_url, api_key, persist_settings)
+    async def generate(self, prompt, n, size, quality, background, output_format, output_compression, moderation, seed, base_url, api_key, persist_settings, unique_id):
+        task_count = _max_list_length(prompt, n, size, quality, background, output_format, output_compression, moderation, seed, base_url, api_key, persist_settings)
         callables = []
 
         for index in range(task_count):
             prompt_value = _clean_string(_pick_list_value(prompt, index))
             if not prompt_value:
                 raise ValueError("Prompt cannot be empty.")
+            fmt = _pick_list_value(output_format, index)
             callables.append(functools.partial(
                 call_images_generate,
                 prompt=prompt_value,
@@ -516,6 +563,14 @@ class GPTImage2Text2Img:
                 base_url=_pick_list_value(base_url, index),
                 api_key=_pick_list_value(api_key, index),
                 persist_settings=bool(_pick_list_value(persist_settings, index)),
+                n=int(_pick_list_value(n, index)),
+                size=_pick_list_value(size, index),
+                quality=_pick_list_value(quality, index),
+                background=_pick_list_value(background, index),
+                output_format=fmt,
+                output_compression=int(_pick_list_value(output_compression, index)),
+                moderation=_pick_list_value(moderation, index),
+                seed=int(_pick_list_value(seed, index)),
             ))
 
         image_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
@@ -541,6 +596,15 @@ class GPTImage2Img2Img:
                     "default": "Apply artistic style and enhance colors",
                     "placeholder": "Describe how to edit the image...",
                 }),
+                "n": ("INT", {"default": 1, "min": 1, "max": 10}),
+                "size": (["auto", "1024x1024", "1536x1024", "1024x1536"], {"default": "auto"}),
+                "quality": (["auto", "high", "medium", "low"], {"default": "auto"}),
+                "background": (["auto", "opaque", "transparent"], {"default": "auto"}),
+                "output_format": (["png", "jpeg", "webp"], {"default": "png"}),
+                "output_compression": ("INT", {"default": 100, "min": 0, "max": 100}),
+                "moderation": (["auto", "low"], {"default": "auto"}),
+                "input_fidelity": (["default", "high", "low"], {"default": "default"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "base_url": ("STRING", {
                     "default": config.get("base_url", DEFAULT_BASE_URL),
                     "placeholder": "OpenAI-compatible base URL",
@@ -560,6 +624,15 @@ class GPTImage2Img2Img:
         self,
         image1,
         prompt,
+        n,
+        size,
+        quality,
+        background,
+        output_format,
+        output_compression,
+        moderation,
+        input_fidelity,
+        seed,
         base_url,
         api_key,
         persist_settings,
@@ -569,11 +642,9 @@ class GPTImage2Img2Img:
         edit_model = config.get("edit_model", DEFAULT_GENERATE_MODEL)
 
         task_count = _max_list_length(
-            image1,
-            prompt,
-            base_url,
-            api_key,
-            persist_settings,
+            image1, prompt, n, size, quality, background,
+            output_format, output_compression, moderation, input_fidelity, seed,
+            base_url, api_key, persist_settings,
         )
 
         callables = []
@@ -587,6 +658,7 @@ class GPTImage2Img2Img:
             if not image_jobs:
                 raise ValueError("At least one image input is required.")
 
+            fmt = _pick_list_value(output_format, index)
             for image_b64_list in image_jobs:
                 if len(image_b64_list) != 1:
                     raise ValueError("Image-to-image edit accepts exactly one image per task.")
@@ -598,6 +670,15 @@ class GPTImage2Img2Img:
                     base_url=_pick_list_value(base_url, index),
                     api_key=_pick_list_value(api_key, index),
                     persist_settings=bool(_pick_list_value(persist_settings, index)),
+                    n=int(_pick_list_value(n, index)),
+                    size=_pick_list_value(size, index),
+                    quality=_pick_list_value(quality, index),
+                    background=_pick_list_value(background, index),
+                    output_format=fmt,
+                    output_compression=int(_pick_list_value(output_compression, index)),
+                    moderation=_pick_list_value(moderation, index),
+                    input_fidelity=_pick_list_value(input_fidelity, index),
+                    seed=int(_pick_list_value(seed, index)),
                 ))
 
         image_groups, status_lines = await _run_parallel_jobs(callables, _pick_list_value(unique_id, 0))
